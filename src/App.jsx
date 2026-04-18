@@ -752,9 +752,14 @@ function TrainingTab() {
             {convProg?.inProgress?"Training...":"Train Conviction Model"}
           </Btn>
           {convResults && !convProg?.inProgress && (
-            <span style={{fontSize:11,color:"#64748b"}}>
-              Last trained: {convResults.generated_at?.slice(0,19).replace("T"," ")}
-            </span>
+            <>
+              <Btn onClick={()=>downloadJson(convResults,`conviction_results_${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.json`)} color="#06b6d4" style={{padding:"8px 12px",fontSize:12}}>
+                Download JSON
+              </Btn>
+              <span style={{fontSize:11,color:"#64748b"}}>
+                Last trained: {convResults.generated_at?.slice(0,19).replace("T"," ")}
+              </span>
+            </>
           )}
         </div>
         {convProg?.inProgress && (
@@ -775,92 +780,123 @@ function TrainingTab() {
         )}
         {convResults && (
           <div style={{marginTop:14}}>
-            {/* Verdict */}
+            {/* Overall verdict */}
             <div style={{marginBottom:12,padding:"8px 12px",borderRadius:4,
-              background: convResults.verdict==="ACHIEVES_80_HIGH_CONFIDENCE"?"rgba(34,197,94,0.08)":"rgba(234,179,8,0.08)",
-              border: `1px solid ${convResults.verdict==="ACHIEVES_80_HIGH_CONFIDENCE"?"rgba(34,197,94,0.25)":"rgba(234,179,8,0.25)"}`}}>
-              <span style={{fontSize:11,color:"#64748b",fontWeight:600,textTransform:"uppercase",letterSpacing:0.3}}>Verdict</span>
-              <span style={{marginLeft:10,color: convResults.verdict==="ACHIEVES_80_HIGH_CONFIDENCE"?"#22c55e":"#eab308",fontWeight:700,letterSpacing:0.3}}>{convResults.verdict}</span>
+              background: convResults.overall_verdict==="ACHIEVES_80_HIGH_CONFIDENCE"?"rgba(34,197,94,0.08)":"rgba(234,179,8,0.08)",
+              border: `1px solid ${convResults.overall_verdict==="ACHIEVES_80_HIGH_CONFIDENCE"?"rgba(34,197,94,0.25)":"rgba(234,179,8,0.25)"}`}}>
+              <span style={{fontSize:11,color:"#64748b",fontWeight:600,textTransform:"uppercase",letterSpacing:0.3}}>Overall verdict</span>
+              <span style={{marginLeft:10,color: convResults.overall_verdict==="ACHIEVES_80_HIGH_CONFIDENCE"?"#22c55e":"#eab308",fontWeight:700,letterSpacing:0.3}}>{convResults.overall_verdict}</span>
               <span style={{marginLeft:16,color:"#94a3b8",fontSize:11}}>
-                AUC test: <b>{convResults.auc_test ?? "—"}</b>
-                {"  ·  "}
-                Features: <b>{convResults.n_features}</b>
-                {"  ·  "}
-                Best iter: <b>{convResults.best_iteration}</b>
+                Passing: <b>{(convResults.passing_targets||[]).length}</b>/{(convResults.target_keys||[]).length}
+                {"  ·  "}Features: <b>{convResults.n_features}</b>
               </span>
             </div>
 
-            {/* Fold sizes + base rates */}
+            {/* Fold sizes */}
             <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(120px,1fr))",gap:8,marginBottom:14}}>
               {["train","val","test"].map(f=>{
                 const n = convResults.fold_sizes?.[f];
-                const br = convResults.base_rates?.[f];
                 return <div key={f} style={{padding:"8px 10px",borderRadius:4,background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.04)"}}>
                   <div style={{fontSize:9,color:"#64748b",fontWeight:600,letterSpacing:0.3,textTransform:"uppercase",marginBottom:3}}>{f}</div>
                   <div style={{fontSize:13,color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>
                     <b>{n?.toLocaleString() ?? "—"}</b> <span style={{color:"#64748b",fontSize:11}}>examples</span>
                   </div>
-                  <div style={{fontSize:11,color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>
-                    base rate: <b>{br ?? "—"}%</b>
-                  </div>
                 </div>;
               })}
             </div>
 
-            {/* Calibration buckets */}
-            <div style={{fontSize:10,color:"#94a3b8",fontWeight:600,textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>Calibration Buckets (TEST fold)</div>
+            {/* Matrix summary: 2 targets × 4 horizons */}
+            <div style={{fontSize:10,color:"#94a3b8",fontWeight:600,textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>Target × Horizon Matrix</div>
             <table style={{width:"100%",fontSize:11,borderCollapse:"collapse",marginBottom:14}}>
               <thead><tr>
-                {["Bucket","n","Hit%","CI 95%","Mean Predicted","Status"].map(col=>
-                  <th key={col} style={{padding:"4px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase"}}>{col}</th>)}
+                <th style={{padding:"4px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase"}}>Target</th>
+                {[30,60,120,180].map(h=>
+                  <th key={h} style={{padding:"4px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase",borderLeft:"1px solid rgba(255,255,255,0.08)"}}>{h}min</th>
+                )}
               </tr></thead>
               <tbody>
-                {(convResults.buckets||[]).map((b,bi)=>{
-                  const isHighConv = b.bucket==="0.8-0.9" || b.bucket==="0.9+";
-                  const passes = isHighConv && b.n>=30 && b.ci_lower_pct!=null && b.ci_lower_pct>=75;
-                  const hr = b.hit_rate_pct;
-                  const hrColor = hr==null?"#64748b":hr>=75?"#22c55e":hr>=60?"#a3e635":hr>=50?"#eab308":hr>=40?"#94a3b8":"#ef4444";
-                  return <tr key={bi} style={{borderTop:"1px solid rgba(255,255,255,0.04)",background:isHighConv?"rgba(139,92,246,0.04)":"transparent"}}>
-                    <td style={{padding:"4px 8px",color:isHighConv?"#c4b5fd":"#e2e8f0",fontWeight:isHighConv?600:400}}>{b.bucket}</td>
-                    <td style={{padding:"4px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{b.n}</td>
-                    <td style={{padding:"4px 8px",color:hrColor,fontVariantNumeric:"tabular-nums",fontWeight:600}}>{hr!=null?`${hr}%`:"—"}</td>
-                    <td style={{padding:"4px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums",fontSize:10}}>
-                      {b.ci_lower_pct!=null && b.ci_upper_pct!=null ? `[${b.ci_lower_pct}%, ${b.ci_upper_pct}%]` : "—"}
-                    </td>
-                    <td style={{padding:"4px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{b.mean_predicted_prob!=null?`${(b.mean_predicted_prob*100).toFixed(1)}%`:"—"}</td>
-                    <td style={{padding:"4px 8px",fontWeight:600,fontSize:10,letterSpacing:0.3}}>
-                      {passes ? <span style={{color:"#22c55e"}}>✓ PASSES 80% BAR</span> : (isHighConv && b.n>0 ? <span style={{color:"#eab308"}}>✗ below bar</span> : "")}
-                    </td>
-                  </tr>;
-                })}
+                {[[75,"+0.75%"],[100,"+1.00%"]].map(([tp,tpLabel])=>
+                  <tr key={tp} style={{borderTop:"1px solid rgba(255,255,255,0.04)"}}>
+                    <td style={{padding:"4px 8px",color:"#e2e8f0",fontWeight:600}}>{tpLabel}</td>
+                    {[30,60,120,180].map(h=>{
+                      const tkey = `t${tp}_h${h}`;
+                      const tres = convResults.per_target?.[tkey];
+                      if (!tres) return <td key={h} style={{padding:"4px 8px",borderLeft:"1px solid rgba(255,255,255,0.08)",color:"#475569"}}>—</td>;
+                      const passes = tres.verdict === "ACHIEVES_80_HIGH_CONFIDENCE";
+                      // Find best high-conviction bucket
+                      const highBuckets = (tres.buckets||[]).filter(b=>["0.8-0.9","0.9+"].includes(b.bucket));
+                      const bestBucket = highBuckets.find(b=>b.n>=30 && b.ci_lower_pct!=null && b.ci_lower_pct>=75);
+                      const auc = tres.auc_test;
+                      const br = tres.base_rates?.test;
+                      return <td key={h} style={{padding:"4px 8px",borderLeft:"1px solid rgba(255,255,255,0.08)",background:passes?"rgba(34,197,94,0.08)":"transparent"}}>
+                        <div style={{fontSize:10,color:passes?"#22c55e":"#94a3b8",fontWeight:passes?700:500}}>
+                          {passes?"✓ PASSES":"✗ below bar"}
+                        </div>
+                        <div style={{fontSize:10,color:"#64748b",fontVariantNumeric:"tabular-nums",marginTop:2}}>
+                          AUC {auc?.toFixed(3)} · base {br}%
+                        </div>
+                        {bestBucket && <div style={{fontSize:10,color:"#22c55e",fontVariantNumeric:"tabular-nums",marginTop:2}}>
+                          {bestBucket.bucket}: {bestBucket.hit_rate_pct}% (n={bestBucket.n})
+                        </div>}
+                      </td>;
+                    })}
+                  </tr>
+                )}
               </tbody>
             </table>
 
-            {/* Top features */}
-            <details>
-              <summary style={{cursor:"pointer",fontSize:11,color:"#94a3b8",fontWeight:600,textTransform:"uppercase",letterSpacing:0.3}}>Top 30 feature importances (click to expand)</summary>
-              <table style={{width:"100%",fontSize:11,borderCollapse:"collapse",marginTop:8}}>
-                <thead><tr>
-                  {["Feature","Importance %"].map(col=>
-                    <th key={col} style={{padding:"3px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase"}}>{col}</th>)}
-                </tr></thead>
-                <tbody>
-                  {(convResults.top_features||[]).map(([name,pct],fi)=>
-                    <tr key={fi} style={{borderTop:"1px solid rgba(255,255,255,0.03)"}}>
-                      <td style={{padding:"3px 8px",color:"#e2e8f0"}}>{name}</td>
-                      <td style={{padding:"3px 8px",color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>
-                        <div style={{display:"flex",alignItems:"center",gap:6}}>
-                          <div style={{width:100,height:5,background:"rgba(255,255,255,0.05)",borderRadius:2,overflow:"hidden"}}>
-                            <div style={{width:`${Math.min(100,pct*2)}%`,height:"100%",background:"#8b5cf6"}}/>
-                          </div>
-                          <span>{pct}%</span>
-                        </div>
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </details>
+            {/* Per-target detail */}
+            <div style={{fontSize:10,color:"#94a3b8",fontWeight:600,textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>Per-target Calibration Detail</div>
+            {(convResults.target_keys||[]).map(tkey=>{
+              const tres = convResults.per_target?.[tkey];
+              if (!tres) return null;
+              const passes = tres.verdict === "ACHIEVES_80_HIGH_CONFIDENCE";
+              return <details key={tkey} style={{marginBottom:8}} open={passes}>
+                <summary style={{cursor:"pointer",padding:"6px 10px",borderRadius:4,
+                  background:passes?"rgba(34,197,94,0.06)":"rgba(255,255,255,0.02)",
+                  border:`1px solid ${passes?"rgba(34,197,94,0.25)":"rgba(255,255,255,0.04)"}`,fontSize:11}}>
+                  <span style={{color:passes?"#22c55e":"#c4b5fd",fontWeight:600}}>{tres.target_pct} in {tres.horizon}</span>
+                  <span style={{marginLeft:10,color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>
+                    AUC test: <b>{tres.auc_test ?? "—"}</b>
+                    {"  ·  "}base rates (tr/va/te): <b>{tres.base_rates?.train}%/{tres.base_rates?.val}%/{tres.base_rates?.test}%</b>
+                  </span>
+                  <span style={{marginLeft:10,color:passes?"#22c55e":"#eab308",fontWeight:700,fontSize:10,letterSpacing:0.3}}>
+                    {passes?"✓ PASSES":"✗ BELOW"}
+                  </span>
+                </summary>
+                <table style={{width:"100%",fontSize:11,borderCollapse:"collapse",marginTop:8,marginBottom:8}}>
+                  <thead><tr>
+                    {["Bucket","n","Hit%","CI 95%","Mean Predicted","Status"].map(col=>
+                      <th key={col} style={{padding:"3px 8px",textAlign:"left",color:"#64748b",fontSize:9,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase"}}>{col}</th>)}
+                  </tr></thead>
+                  <tbody>
+                    {(tres.buckets||[]).map((b,bi)=>{
+                      const isHigh = b.bucket==="0.8-0.9" || b.bucket==="0.9+";
+                      const bPass = isHigh && b.n>=30 && b.ci_lower_pct!=null && b.ci_lower_pct>=75;
+                      const hr = b.hit_rate_pct;
+                      const hrColor = hr==null?"#64748b":hr>=75?"#22c55e":hr>=60?"#a3e635":hr>=50?"#eab308":hr>=40?"#94a3b8":"#ef4444";
+                      return <tr key={bi} style={{borderTop:"1px solid rgba(255,255,255,0.03)",background:isHigh?"rgba(139,92,246,0.04)":"transparent"}}>
+                        <td style={{padding:"3px 8px",color:isHigh?"#c4b5fd":"#e2e8f0",fontWeight:isHigh?600:400}}>{b.bucket}</td>
+                        <td style={{padding:"3px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{b.n}</td>
+                        <td style={{padding:"3px 8px",color:hrColor,fontVariantNumeric:"tabular-nums",fontWeight:600}}>{hr!=null?`${hr}%`:"—"}</td>
+                        <td style={{padding:"3px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums",fontSize:10}}>
+                          {b.ci_lower_pct!=null && b.ci_upper_pct!=null ? `[${b.ci_lower_pct}%, ${b.ci_upper_pct}%]` : "—"}
+                        </td>
+                        <td style={{padding:"3px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{b.mean_predicted_prob!=null?`${(b.mean_predicted_prob*100).toFixed(1)}%`:"—"}</td>
+                        <td style={{padding:"3px 8px",fontSize:9,fontWeight:600,letterSpacing:0.3}}>
+                          {bPass ? <span style={{color:"#22c55e"}}>✓ PASSES</span> : (isHigh && b.n>0 ? <span style={{color:"#eab308"}}>✗ below</span> : "")}
+                        </td>
+                      </tr>;
+                    })}
+                  </tbody>
+                </table>
+                {/* Top features for this target */}
+                <div style={{fontSize:9,color:"#64748b",fontWeight:600,letterSpacing:0.3,textTransform:"uppercase",marginBottom:2,marginTop:4}}>Top 15 features ({tkey})</div>
+                <div style={{fontSize:10,color:"#94a3b8"}}>
+                  {(tres.top_features||[]).map(([name,pct])=>`${name} (${pct}%)`).join(" · ")}
+                </div>
+              </details>;
+            })}
           </div>
         )}
       </Box>

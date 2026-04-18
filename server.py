@@ -2409,6 +2409,24 @@ def did_hit_target(entry_price, bars_after_entry, target_pct=0.01):
         return (False, (final - entry_price) / entry_price * 100)
     return (False, 0.0)
 
+def did_hit_target_within_horizon(entry_price, bars_after_entry, target_pct, horizon_minutes, scan_minute_et):
+    """
+    v26: Did price reach entry*(1+target_pct) WITHIN horizon_minutes after scan,
+    OR before 15:55 force-close (whichever is earlier)?
+    Returns boolean hit.
+    """
+    target = entry_price * (1 + target_pct)
+    # Deadline = min(scan_minute + horizon, FORCED_CLOSE_MIN)
+    deadline = min(scan_minute_et + horizon_minutes, FORCED_CLOSE_MIN)
+    for b in bars_after_entry:
+        bm = bar_to_et_minutes(b)
+        if bm is None: continue
+        if bm >= deadline:
+            return False  # deadline passed, no hit
+        if b["h"] >= target:
+            return True
+    return False
+
 # ═══════════════════════════════════════════════════════════════════
 # v9: SETUP EVALUATION — three-way split on historic data
 # ═══════════════════════════════════════════════════════════════════
@@ -4721,14 +4739,23 @@ def run_conviction_training():
                                            scan_minute_et=scan_minute_et)
                     setup_flags = {f"setup_{s}": int(bool(active[s])) for s in SETUP_NAMES}
 
-                    # Target: did price reach +1% before 15:55?
-                    # after bars include scan bar itself at index 0; actual future is after[1:]
-                    hit, pnl = did_hit_target(scan_price, after[1:], target_pct=0.01)
+                    # v26: compute 8 target labels per example
+                    # 2 target pcts × 4 horizons
+                    labels = {}
+                    for target_pct in [0.0075, 0.01]:
+                        for horizon_min in [30, 60, 120, 180]:
+                            hit = did_hit_target_within_horizon(
+                                scan_price, after[1:], target_pct=target_pct,
+                                horizon_minutes=horizon_min,
+                                scan_minute_et=scan_minute_et,
+                            )
+                            key = f"t{int(target_pct*10000)}_h{horizon_min}"  # e.g. "t75_h30" or "t100_h60"
+                            labels[key] = 1 if hit else 0
 
                     date_hour_rows.append({
                         "date": date, "hour": scan_hour, "ticker": ticker, "sector": sec,
                         "feat": feat, "setup_flags": setup_flags,
-                        "label": 1 if hit else 0,
+                        "labels": labels,
                     })
 
                 if len(date_hour_rows) < 10: continue
@@ -4743,15 +4770,15 @@ def run_conviction_training():
                 for r in date_hour_rows:
                     examples.append({
                         "fold": fold, "date": date, "hour": scan_hour, "ticker": r["ticker"],
-                        "feat": r["feat"], "setup_flags": r["setup_flags"], "label": r["label"],
+                        "feat": r["feat"], "setup_flags": r["setup_flags"],
+                        "labels": r["labels"],  # v26: dict of 8 labels
                     })
 
         log.info(f"Built {len(examples)} examples total")
-        conviction_train_progress = {"phase":"vectorize","pct":70,
+        conviction_train_progress = {"phase":"vectorize","pct":60,
             "message":f"Vectorizing {len(examples)} examples..."}
 
-        # Build feature matrix
-        # Base features + setup flags
+        # Build feature matrix ONCE (shared across all 8 target models)
         base_feat_names = FEATURE_NAMES
         setup_feat_names = [f"setup_{s}" for s in SETUP_NAMES]
         all_feat_names = base_feat_names + setup_feat_names + ["hour_11","hour_12","hour_13","hour_14","hour_15"]
@@ -4764,37 +4791,37 @@ def run_conviction_training():
             v += [1.0 if ex["hour"] == h else 0.0 for h in [11,12,13,14,15]]
             return v
 
-        X_train, y_train = [], []
-        X_val, y_val = [], []
-        X_test, y_test = [], []
-        meta_test = []  # keep track of test (date, hour, ticker) for inspection
+        # Partition by fold once
+        X_train_list, labels_train_dict = [], defaultdict(list)
+        X_val_list, labels_val_dict = [], defaultdict(list)
+        X_test_list, labels_test_dict = [], defaultdict(list)
+        meta_test = []
+        target_keys = [f"t{int(tp*10000)}_h{h}" for tp in [0.0075, 0.01] for h in [30, 60, 120, 180]]
+        log.info(f"v26: training 8 target models: {target_keys}")
+
         for ex in examples:
             vec = row_to_vec(ex)
-            if ex["fold"] == "train":
-                X_train.append(vec); y_train.append(ex["label"])
-            elif ex["fold"] == "val":
-                X_val.append(vec); y_val.append(ex["label"])
-            else:
-                X_test.append(vec); y_test.append(ex["label"])
+            bucket_map = {
+                "train": (X_train_list, labels_train_dict),
+                "val": (X_val_list, labels_val_dict),
+                "test": (X_test_list, labels_test_dict),
+            }
+            xlist, ylist = bucket_map[ex["fold"]]
+            xlist.append(vec)
+            for k in target_keys:
+                ylist[k].append(ex["labels"].get(k, 0))
+            if ex["fold"] == "test":
                 meta_test.append({"date": ex["date"], "hour": ex["hour"], "ticker": ex["ticker"]})
 
-        X_train = np.array(X_train, dtype=np.float32)
-        y_train = np.array(y_train, dtype=np.int32)
-        X_val = np.array(X_val, dtype=np.float32)
-        y_val = np.array(y_val, dtype=np.int32)
-        X_test = np.array(X_test, dtype=np.float32)
-        y_test = np.array(y_test, dtype=np.int32)
-
+        X_train = np.array(X_train_list, dtype=np.float32)
+        X_val = np.array(X_val_list, dtype=np.float32)
+        X_test = np.array(X_test_list, dtype=np.float32)
         log.info(f"Matrix shapes: train={X_train.shape}, val={X_val.shape}, test={X_test.shape}")
-        log.info(f"Base rates: train={y_train.mean():.3f}, val={y_val.mean():.3f}, test={y_test.mean():.3f}")
 
         if len(X_train) < 1000 or len(X_val) < 200:
             raise RuntimeError(f"Insufficient examples: train={len(X_train)}, val={len(X_val)}")
 
-        conviction_train_progress = {"phase":"training","pct":80,"message":"Training LightGBM..."}
-        # Train LightGBM classifier
-        train_ds = lgb.Dataset(X_train, label=y_train, feature_name=all_feat_names)
-        val_ds = lgb.Dataset(X_val, label=y_val, feature_name=all_feat_names, reference=train_ds)
+        # Shared LightGBM params
         params = {
             "objective": "binary",
             "metric": "binary_logloss",
@@ -4807,34 +4834,10 @@ def run_conviction_training():
             "lambda_l2": 1.0,
             "verbose": -1,
         }
-        model = lgb.train(
-            params, train_ds,
-            num_boost_round=500,
-            valid_sets=[val_ds], valid_names=["val"],
-            callbacks=[lgb.early_stopping(30), lgb.log_evaluation(0)],
-        )
-        log.info(f"Trained LightGBM, best iteration: {model.best_iteration}")
 
-        # Get raw predictions on val fold for calibration
-        raw_val = model.predict(X_val, num_iteration=model.best_iteration)
-        # Fit isotonic regression calibrator on val fold
-        calibrator = IsotonicRegression(out_of_bounds="clip")
-        calibrator.fit(raw_val, y_val)
-
-        # Apply to test
-        conviction_train_progress = {"phase":"evaluating","pct":90,"message":"Evaluating on test fold..."}
-        raw_test = model.predict(X_test, num_iteration=model.best_iteration)
-        calib_test = calibrator.transform(raw_test)
-
-        # Test-fold overall metrics
+        # Train all 8 target models
         from sklearn.metrics import roc_auc_score as _auc
-        try:
-            auc_test = _auc(y_test, raw_test)
-        except Exception:
-            auc_test = None
-
-        # Bucket by calibrated probability
-        buckets = [
+        buckets_def = [
             (0.0, 0.3, "0.0-0.3"),
             (0.3, 0.4, "0.3-0.4"),
             (0.4, 0.5, "0.4-0.5"),
@@ -4844,70 +4847,124 @@ def run_conviction_training():
             (0.8, 0.9, "0.8-0.9"),
             (0.9, 1.01, "0.9+"),
         ]
-        bucket_stats = []
-        for lo, hi, label in buckets:
-            mask = (calib_test >= lo) & (calib_test < hi)
-            n = int(mask.sum())
-            if n == 0:
-                bucket_stats.append({
-                    "bucket": label, "n": 0, "n_hits": 0,
-                    "hit_rate_pct": None, "ci_lower_pct": None, "ci_upper_pct": None,
-                    "mean_predicted_prob": None,
-                })
+        all_target_results = {}
+
+        for ti, tkey in enumerate(target_keys):
+            pct_done = 65 + int((ti / len(target_keys)) * 32)
+            conviction_train_progress = {"phase":"training","pct":pct_done,
+                "message":f"Training target {ti+1}/{len(target_keys)}: {tkey}"}
+
+            y_train = np.array(labels_train_dict[tkey], dtype=np.int32)
+            y_val = np.array(labels_val_dict[tkey], dtype=np.int32)
+            y_test = np.array(labels_test_dict[tkey], dtype=np.int32)
+
+            # Train
+            train_ds = lgb.Dataset(X_train, label=y_train, feature_name=all_feat_names)
+            val_ds = lgb.Dataset(X_val, label=y_val, feature_name=all_feat_names, reference=train_ds)
+            try:
+                model = lgb.train(
+                    params, train_ds,
+                    num_boost_round=500,
+                    valid_sets=[val_ds], valid_names=["val"],
+                    callbacks=[lgb.early_stopping(30), lgb.log_evaluation(0)],
+                )
+            except Exception as e:
+                log.error(f"Training {tkey} failed: {e}")
+                all_target_results[tkey] = {"error": str(e)}
                 continue
-            hits = int(y_test[mask].sum())
-            lower, upper = wilson_ci(hits, n)
-            bucket_stats.append({
-                "bucket": label, "n": n, "n_hits": hits,
-                "hit_rate_pct": round(hits / n * 100, 2),
-                "ci_lower_pct": round(lower * 100, 2),
-                "ci_upper_pct": round(upper * 100, 2),
-                "mean_predicted_prob": round(float(calib_test[mask].mean()), 3),
-            })
 
-        # Verdict
-        # Pass: any bucket with label >= 0.8 has n>=30 and ci_lower >= 75
-        pass_buckets = []
-        for b in bucket_stats:
-            if b["bucket"] in ("0.8-0.9", "0.9+") and b["n"] is not None and b["n"] >= 30 and b["ci_lower_pct"] is not None and b["ci_lower_pct"] >= 75:
-                pass_buckets.append(b)
-        verdict = "ACHIEVES_80_HIGH_CONFIDENCE" if pass_buckets else "DOES_NOT_ACHIEVE_80"
+            # Calibrate on val
+            raw_val = model.predict(X_val, num_iteration=model.best_iteration)
+            calibrator = IsotonicRegression(out_of_bounds="clip")
+            calibrator.fit(raw_val, y_val)
 
-        # Feature importance
-        importance_raw = model.feature_importance(importance_type="gain")
-        feat_imp = sorted(
-            [(name, float(imp)) for name, imp in zip(all_feat_names, importance_raw)],
-            key=lambda x: -x[1]
-        )
-        total_imp = sum(i for _, i in feat_imp) or 1
-        feat_imp_pct = [(n, round(i / total_imp * 100, 2)) for n, i in feat_imp]
+            # Predict test
+            raw_test = model.predict(X_test, num_iteration=model.best_iteration)
+            calib_test = calibrator.transform(raw_test)
+
+            try:
+                auc_test = round(_auc(y_test, raw_test), 4)
+            except Exception:
+                auc_test = None
+
+            # Buckets
+            bucket_stats = []
+            for lo, hi, label in buckets_def:
+                mask = (calib_test >= lo) & (calib_test < hi)
+                n = int(mask.sum())
+                if n == 0:
+                    bucket_stats.append({
+                        "bucket": label, "n": 0, "n_hits": 0,
+                        "hit_rate_pct": None, "ci_lower_pct": None, "ci_upper_pct": None,
+                        "mean_predicted_prob": None,
+                    })
+                    continue
+                hits = int(y_test[mask].sum())
+                lower, upper = wilson_ci(hits, n)
+                bucket_stats.append({
+                    "bucket": label, "n": n, "n_hits": hits,
+                    "hit_rate_pct": round(hits / n * 100, 2),
+                    "ci_lower_pct": round(lower * 100, 2),
+                    "ci_upper_pct": round(upper * 100, 2),
+                    "mean_predicted_prob": round(float(calib_test[mask].mean()), 3),
+                })
+
+            # Verdict
+            pass_buckets = []
+            for b in bucket_stats:
+                if b["bucket"] in ("0.8-0.9", "0.9+") and b["n"] and b["n"] >= 30 and b["ci_lower_pct"] is not None and b["ci_lower_pct"] >= 75:
+                    pass_buckets.append(b)
+            verdict = "ACHIEVES_80_HIGH_CONFIDENCE" if pass_buckets else "DOES_NOT_ACHIEVE_80"
+
+            # Feature importance
+            importance_raw = model.feature_importance(importance_type="gain")
+            feat_imp = sorted(
+                [(name, float(imp)) for name, imp in zip(all_feat_names, importance_raw)],
+                key=lambda x: -x[1]
+            )
+            total_imp = sum(i for _, i in feat_imp) or 1
+            feat_imp_pct = [(n, round(i / total_imp * 100, 2)) for n, i in feat_imp]
+
+            # Parse target key back to human labels
+            # e.g. "t75_h30" → +0.75% within 30 min
+            tp_code, h_code = tkey.split("_")
+            target_pct_pretty = f"+{int(tp_code[1:])/100:.2f}%"  # 75 → 0.75
+            horizon_pretty = f"{h_code[1:]}min"
+
+            all_target_results[tkey] = {
+                "target_pct": target_pct_pretty,
+                "horizon": horizon_pretty,
+                "base_rates": {
+                    "train": round(float(y_train.mean()) * 100, 2),
+                    "val": round(float(y_val.mean()) * 100, 2),
+                    "test": round(float(y_test.mean()) * 100, 2),
+                },
+                "auc_test": auc_test,
+                "buckets": bucket_stats,
+                "verdict": verdict,
+                "top_features": feat_imp_pct[:15],
+                "best_iteration": model.best_iteration,
+            }
+            log.info(f"{tkey} ({target_pct_pretty} in {horizon_pretty}): AUC={auc_test}, verdict={verdict}")
+
+        # Summary
+        passing = [k for k, r in all_target_results.items() if r.get("verdict") == "ACHIEVES_80_HIGH_CONFIDENCE"]
+        overall_verdict = "ACHIEVES_80_HIGH_CONFIDENCE" if passing else "DOES_NOT_ACHIEVE_80"
 
         results = {
             "generated_at": datetime.now(ET).isoformat(),
             "fold_sizes": {"train": len(X_train), "val": len(X_val), "test": len(X_test)},
-            "base_rates": {
-                "train": round(float(y_train.mean()) * 100, 2),
-                "val": round(float(y_val.mean()) * 100, 2),
-                "test": round(float(y_test.mean()) * 100, 2),
-            },
-            "auc_test": round(auc_test, 4) if auc_test is not None else None,
-            "buckets": bucket_stats,
-            "verdict": verdict,
-            "top_features": feat_imp_pct[:30],
-            "best_iteration": model.best_iteration,
             "n_features": len(all_feat_names),
+            "target_keys": target_keys,
+            "overall_verdict": overall_verdict,
+            "passing_targets": passing,
+            "per_target": all_target_results,
         }
         CONVICTION_RESULTS_PATH.write_text(json.dumps(results, indent=2, default=str))
 
-        # Save model + calibrator for potential live use
-        with open(CONVICTION_MODEL_PATH, "wb") as f:
-            pickle.dump(model, f)
-        with open(CONVICTION_CALIB_PATH, "wb") as f:
-            pickle.dump(calibrator, f)
-
-        log.info(f"Conviction model training complete. Verdict: {verdict}. AUC: {auc_test}")
+        log.info(f"v26 multi-target training complete. Passing: {passing}")
         conviction_train_progress = {"phase":"done","pct":100,
-            "message":f"Done. Verdict: {verdict}. AUC test: {auc_test}"}
+            "message":f"Done. {len(passing)} of {len(target_keys)} targets passed 80% bar."}
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
