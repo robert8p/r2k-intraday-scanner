@@ -1810,6 +1810,86 @@ function SetupsTab() {
         </Box>
       )}
 
+      {/* v24: CONVICTION RANKING TEST */}
+      {hasResults && results.conviction_ranking_test && (
+        <Box>
+          <Lbl>Conviction Ranking Test (v24) — does ranking by conviction actually improve hit rate?</Lbl>
+          <div style={{fontSize:10,color:"#475569",marginBottom:10,lineHeight:1.5}}>
+            For each (date, hour), ranks firings by conviction score (test_edge + test_hit_rate × 0.5, with +20% ROBUST boost, redundant-pair dedup). Measures hit rate of top-N cutoffs vs all-firings hit rate across train / val / test folds. <b>Verdict</b>: RANKING_WORKS (top-10 Δ ≥+5pp on val+test), RANKING_HELPS_MARGINALLY (≥+2pp), RANKING_NEUTRAL (|Δ|&lt;2pp), RANKING_HURTS (any fold ≤-2pp). If RANKING_WORKS: deploy in live scanner. If not: revise scoring formula.
+          </div>
+          {(() => {
+            const cr = results.conviction_ranking_test;
+            const verdict = cr.verdict;
+            const vColor = verdict==="RANKING_WORKS"?"#22c55e":verdict==="RANKING_HELPS_MARGINALLY"?"#a3e635":verdict==="RANKING_NEUTRAL"?"#94a3b8":verdict==="RANKING_HURTS"?"#ef4444":"#eab308";
+            const cutoffKeys = ["top_1","top_3","top_5","top_10","top_20","all"];
+            const folds = ["train","val","test"];
+            return <>
+              <div style={{marginBottom:10,padding:"6px 10px",borderRadius:4,background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.04)"}}>
+                <span style={{fontSize:11,color:"#64748b",fontWeight:600,letterSpacing:0.3,textTransform:"uppercase"}}>Verdict</span>
+                <span style={{marginLeft:10,color:vColor,fontWeight:700,letterSpacing:0.3}}>{verdict}</span>
+                <span style={{marginLeft:16,color:"#94a3b8",fontSize:11}}>Monotonic val: <b>{cr.monotonic_val?"✓":"✗"}</b></span>
+                <span style={{marginLeft:10,color:"#94a3b8",fontSize:11}}>Monotonic test: <b>{cr.monotonic_test?"✓":"✗"}</b></span>
+              </div>
+
+              {/* Cutoff × fold table */}
+              <table style={{width:"100%",fontSize:11,borderCollapse:"collapse",marginBottom:14}}>
+                <thead><tr>
+                  <th style={{padding:"4px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase"}}>Cutoff</th>
+                  {folds.map(f=><th key={f} colSpan={3} style={{padding:"4px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase",borderLeft:"1px solid rgba(255,255,255,0.08)"}}>{f.toUpperCase()}</th>)}
+                </tr><tr>
+                  <th></th>
+                  {folds.map(f=><Fragment key={f}>
+                    <th style={{padding:"2px 8px",textAlign:"left",color:"#475569",fontSize:9,fontWeight:500,borderLeft:"1px solid rgba(255,255,255,0.08)"}}>n</th>
+                    <th style={{padding:"2px 8px",textAlign:"left",color:"#475569",fontSize:9,fontWeight:500}}>Hit%</th>
+                    <th style={{padding:"2px 8px",textAlign:"left",color:"#475569",fontSize:9,fontWeight:500}}>Δ vs all</th>
+                  </Fragment>)}
+                </tr></thead>
+                <tbody>
+                  {cutoffKeys.map(c=>{
+                    const isAll = c==="all";
+                    return <tr key={c} style={{borderTop:"1px solid rgba(255,255,255,0.03)",background:isAll?"rgba(255,255,255,0.02)":"transparent"}}>
+                      <td style={{padding:"3px 8px",color:isAll?"#64748b":"#e2e8f0",fontWeight:isAll?400:600,fontStyle:isAll?"italic":"normal"}}>{c.replace("_"," ")}</td>
+                      {folds.map(f=>{
+                        const fd = cr.by_fold?.[f]?.cutoffs?.[c];
+                        if (!fd) return <Fragment key={f}>
+                          <td style={{padding:"3px 8px",borderLeft:"1px solid rgba(255,255,255,0.08)"}}>—</td><td></td><td></td>
+                        </Fragment>;
+                        const d = fd.delta_vs_all;
+                        const dColor = d==null?"#64748b":d>=5?"#22c55e":d>=2?"#a3e635":d<-2?"#ef4444":"#94a3b8";
+                        return <Fragment key={f}>
+                          <td style={{padding:"3px 8px",color:"#64748b",fontVariantNumeric:"tabular-nums",borderLeft:"1px solid rgba(255,255,255,0.08)"}}>{fd.n_stocks}</td>
+                          <td style={{padding:"3px 8px",color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>{fd.hit_rate!=null?`${fd.hit_rate}%`:"—"}</td>
+                          <td style={{padding:"3px 8px",color:dColor,fontVariantNumeric:"tabular-nums",fontWeight:600}}>{isAll?"—":(d!=null?`${d>0?"+":""}${d}pp`:"—")}</td>
+                        </Fragment>;
+                      })}
+                    </tr>;
+                  })}
+                </tbody>
+              </table>
+
+              {/* Per-setup scores reference */}
+              <details>
+                <summary style={{cursor:"pointer",fontSize:11,color:"#94a3b8",fontWeight:600,textTransform:"uppercase",letterSpacing:0.3}}>Per-setup base scores (click to expand)</summary>
+                <table style={{width:"100%",fontSize:11,borderCollapse:"collapse",marginTop:8}}>
+                  <thead><tr>
+                    {["Setup","Score"].map(col=>
+                      <th key={col} style={{padding:"3px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase"}}>{col}</th>)}
+                  </tr></thead>
+                  <tbody>
+                    {Object.entries(cr.setup_hour_scores||{}).sort((a,b)=>b[1]-a[1]).map(([k,sc])=>
+                      <tr key={k} style={{borderTop:"1px solid rgba(255,255,255,0.03)"}}>
+                        <td style={{padding:"3px 8px",color:"#e2e8f0"}}>{k}</td>
+                        <td style={{padding:"3px 8px",color:"#e2e8f0",fontVariantNumeric:"tabular-nums",fontWeight:600}}>{sc}</td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </details>
+            </>;
+          })()}
+        </Box>
+      )}
+
       {/* v23: LIVE-READINESS SIMULATION */}
       {hasResults && results.live_simulation && (
         <Box>

@@ -4350,6 +4350,189 @@ def run_setup_evaluation(target_pct=0.01):
                  f"{n_zero_days} zero-firing days, {total_atr_filtered} ATR-filtered")
         _save_results()
 
+        # ═══════════════════════════════════════════════════════════════
+        # v24: CONVICTION RANKING TEST
+        # Core question: does ranking firings by conviction improve hit rate?
+        # If top-N hit rate is materially higher than all-firings hit rate,
+        # ranking works and we can deploy it in the live scanner.
+        # If top-N ≈ all-firings, our scoring isn't capturing edge and we
+        # need to revise before deploying.
+        #
+        # Per-firing score formula:
+        #   base = setup.test_edge + setup.test_hit_rate * 0.5
+        #   if setup is ROBUST (fold_swap): base *= 1.2
+        # Per-stock score (when multiple setups fire on same stock):
+        #   sum(base for each firing setup), minus redundancy penalty
+        #   (subtract score of weaker setup in known-redundant pairs)
+        #
+        # For each (date, hour), rank stocks by score; measure hit rate at
+        # top-1, top-3, top-5, top-10, top-20, all cutoffs, per fold.
+        # ═══════════════════════════════════════════════════════════════
+        setup_eval_progress = {"phase":"conv_rank_test","pct":99.98,
+            "message":"Conviction ranking test..."}
+
+        # Build per-(setup, hour) base score from test fold numbers (what live uses)
+        # This is the score each firing CONTRIBUTES to a stock's total at that hour.
+        setup_hour_score = {}  # (setup, hour) → base_score
+        for h_str, hr in results.get("hours", {}).items():
+            h = int(h_str)
+            for s, sd in hr.get("setups", {}).items():
+                t = sd.get("test", {})
+                hit = t.get("hit_rate")
+                edge = t.get("edge_vs_base")
+                n = t.get("n_events", 0)
+                if hit is None or edge is None: continue
+                # Only active setups qualify (tier check)
+                tier = None
+                if edge >= SETUP_EVIDENCE_THRESHOLDS["strong"]["edge"] and n >= SETUP_EVIDENCE_THRESHOLDS["strong"]["n"]:
+                    tier = "strong"
+                elif edge >= SETUP_EVIDENCE_THRESHOLDS["moderate"]["edge"] and n >= SETUP_EVIDENCE_THRESHOLDS["moderate"]["n"]:
+                    tier = "moderate"
+                if not tier: continue
+                # Ex-F_A gate
+                ex_fa = ex_fa_result.get("by_hour", {}).get(h_str, {}).get("setups", {}).get(s, {})
+                if ex_fa.get("ex_fa_edge") is not None and not ex_fa.get("holds_up", False):
+                    continue  # dropped
+                # ROBUST boost
+                fs = fold_swap_result.get("by_hour", {}).get(h_str, {}).get(s, {})
+                rob = fs.get("robustness")
+                base = edge + hit * 0.5
+                if rob == "ROBUST": base *= 1.2
+                setup_hour_score[(s, h)] = round(base, 2)
+
+        log.info(f"Conv-rank: {len(setup_hour_score)} active setup-hours with scores")
+
+        # v16 redundant pair list — actual pairs identified in overlap analysis
+        REDUNDANT_PAIRS_SERVER = [
+            ("orb_vol", "orb_60_break"),  # v16 overlap found J=0.50-0.60 at 13:00 and 15:00
+        ]
+
+        # Fold definitions (from earlier in run)
+        fold_sets = {"train": train_dates, "val": val_dates, "test": test_dates}
+
+        # Compute per-stock-per-day-per-hour scores from all firing events
+        # all_events_by_hour[h]["events"][setup] = [event records, each has date+ticker+hit]
+        #
+        # For each (date, hour, ticker), aggregate: sum of active setup scores, minus redundancy.
+        # Then rank stocks within each (date, hour) and measure hit rate at each cutoff.
+        per_hour_stocks = defaultdict(lambda: defaultdict(lambda: {
+            "setups_fired": [], "score": 0.0, "hit": None
+        }))
+        # Structure: per_hour_stocks[(date, hour)][ticker] = {setups_fired, score, hit}
+
+        for h, hr in all_events_by_hour.items():
+            events_by_setup = hr.get("events", {})
+            for s, ev_list in events_by_setup.items():
+                if (s, h) not in setup_hour_score: continue  # not an active setup
+                base_score = setup_hour_score[(s, h)]
+                for e in ev_list:
+                    date = e["date"]
+                    ticker = e["ticker"]
+                    rec = per_hour_stocks[(date, h)][ticker]
+                    rec["setups_fired"].append((s, base_score))
+                    rec["hit"] = e["hit"]  # same hit for same (date,hour,ticker)
+
+        # Now compute aggregate score with redundancy penalty
+        for (date, h), tickers in per_hour_stocks.items():
+            for ticker, rec in tickers.items():
+                fired_set = set(s for s, _ in rec["setups_fired"])
+                score_map = dict(rec["setups_fired"])
+                total = sum(score_map.values())
+                # Redundancy: for each redundant pair that fires together, subtract weaker
+                for (a, b) in REDUNDANT_PAIRS_SERVER:
+                    if a in fired_set and b in fired_set:
+                        total -= min(score_map[a], score_map[b])
+                rec["score"] = round(total, 2)
+
+        # For each fold, rank per (date, hour) and measure hit rate at cutoffs
+        cutoffs = [1, 3, 5, 10, 20]
+        conv_rank_result = {
+            "setup_hour_scores": {f"{s}@{h}": sc for (s, h), sc in sorted(setup_hour_score.items())},
+            "by_fold": {},
+        }
+
+        for fold_name, fold_dates_set in fold_sets.items():
+            fold_cutoff_stats = {f"top_{c}": {"n_stocks": 0, "n_hits": 0} for c in cutoffs}
+            fold_cutoff_stats["all"] = {"n_stocks": 0, "n_hits": 0}
+            n_scan_slots = 0  # (date, hour) slots with ≥1 firing
+
+            # Also track per-(date,hour) top-N hit rate for day-level stats
+            daily_stats = defaultdict(lambda: {f"top_{c}": {"n": 0, "hits": 0} for c in cutoffs + ["all"]})
+
+            for (date, h), tickers in per_hour_stocks.items():
+                if date not in fold_dates_set: continue
+                if not tickers: continue
+                n_scan_slots += 1
+
+                # Rank by score desc
+                ranked = sorted(tickers.items(), key=lambda kv: -kv[1]["score"])
+
+                # Measure hit rate at each cutoff
+                for c in cutoffs:
+                    top_c = ranked[:c]
+                    fold_cutoff_stats[f"top_{c}"]["n_stocks"] += len(top_c)
+                    fold_cutoff_stats[f"top_{c}"]["n_hits"] += sum(1 for _, r in top_c if r["hit"])
+                # All
+                fold_cutoff_stats["all"]["n_stocks"] += len(ranked)
+                fold_cutoff_stats["all"]["n_hits"] += sum(1 for _, r in ranked if r["hit"])
+
+            # Compute hit rates
+            fold_out = {"n_scan_slots": n_scan_slots, "cutoffs": {}}
+            for key, stats in fold_cutoff_stats.items():
+                n = stats["n_stocks"]
+                hits = stats["n_hits"]
+                hr = (hits / n * 100) if n > 0 else None
+                fold_out["cutoffs"][key] = {
+                    "n_stocks": n,
+                    "n_hits": hits,
+                    "hit_rate": round(hr, 2) if hr is not None else None,
+                }
+
+            # Baseline: hit rate of "all" firings for this fold
+            all_hr = fold_out["cutoffs"]["all"]["hit_rate"]
+            # Delta vs all
+            for key, c_stats in fold_out["cutoffs"].items():
+                if c_stats["hit_rate"] is not None and all_hr is not None:
+                    c_stats["delta_vs_all"] = round(c_stats["hit_rate"] - all_hr, 2)
+                else:
+                    c_stats["delta_vs_all"] = None
+
+            conv_rank_result["by_fold"][fold_name] = fold_out
+
+        # Monotonicity check: is top_1 >= top_3 >= top_5 >= top_10 >= top_20 >= all?
+        # Validated on val AND test folds for out-of-sample check.
+        def monotonic_check(fold_data):
+            order = ["top_1", "top_3", "top_5", "top_10", "top_20", "all"]
+            hrs = [fold_data["cutoffs"][k]["hit_rate"] for k in order]
+            if any(x is None for x in hrs): return False
+            return all(hrs[i] >= hrs[i+1] - 0.5 for i in range(len(hrs)-1))  # 0.5pp slop
+
+        conv_rank_result["monotonic_val"] = monotonic_check(conv_rank_result["by_fold"]["val"])
+        conv_rank_result["monotonic_test"] = monotonic_check(conv_rank_result["by_fold"]["test"])
+
+        # Verdict: does ranking improve top-10 hit rate by ≥5pp vs all on BOTH val and test?
+        val_top10_delta = conv_rank_result["by_fold"]["val"]["cutoffs"]["top_10"].get("delta_vs_all")
+        test_top10_delta = conv_rank_result["by_fold"]["test"]["cutoffs"]["top_10"].get("delta_vs_all")
+        if val_top10_delta is not None and test_top10_delta is not None:
+            if val_top10_delta >= 5.0 and test_top10_delta >= 5.0:
+                verdict = "RANKING_WORKS"
+            elif val_top10_delta >= 2.0 and test_top10_delta >= 2.0:
+                verdict = "RANKING_HELPS_MARGINALLY"
+            elif abs(val_top10_delta) < 2.0 and abs(test_top10_delta) < 2.0:
+                verdict = "RANKING_NEUTRAL"
+            elif val_top10_delta < -2.0 or test_top10_delta < -2.0:
+                verdict = "RANKING_HURTS"
+            else:
+                verdict = "INCONSISTENT"
+        else:
+            verdict = "INSUFFICIENT"
+        conv_rank_result["verdict"] = verdict
+
+        results["conviction_ranking_test"] = conv_rank_result
+        log.info(f"Conviction ranking test complete: verdict={verdict}, "
+                 f"val Δ={val_top10_delta}, test Δ={test_top10_delta}")
+        _save_results()
+
         SETUP_RESULTS_PATH.write_text(json.dumps(results, indent=2, default=str))
         setup_eval_progress = {"phase":"done","pct":100,
             "message":f"Done. Evaluated {len(SETUP_NAMES)} setups × {len(SCAN_HOURS)} scan hours."}
