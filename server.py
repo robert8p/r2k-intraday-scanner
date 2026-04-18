@@ -4168,16 +4168,10 @@ def run_setup_evaluation(target_pct=0.01):
         # Simulate what the live scanner would have produced across the
         # most recent 30 trading days, applying the same filters that
         # live code applies (ex_fa gate + breadth_rule + atr_filter_rule).
-        # NOT for edge analysis — for operational sanity-checking:
-        #   - Per-day firing count (idle days? overloaded days?)
-        #   - Hour distribution (does firing cluster at expected hours?)
-        #   - Setup distribution (which setups dominate?)
-        #   - ATR filter impact (how many rel_strength_iwm filtered out?)
-        #   - Simultaneous firings (same stock, multiple setups)
-        #   - Capital requirement (median/max daily firings)
         # ═══════════════════════════════════════════════════════════════
         setup_eval_progress = {"phase":"live_sim","pct":99.97,
             "message":"Live-readiness simulation..."}
+        log.info("v23.1 live simulation block: ENTRY")
 
         # Identify active setup list using same logic as live loader:
         #   (1) survivor in original (strong/moderate tier on main test fold)
@@ -4361,8 +4355,20 @@ def run_setup_evaluation(target_pct=0.01):
         log.info("Setup evaluation complete")
 
     except Exception as e:
-        log.error(f"Setup eval failed: {e}", exc_info=True)
+        import traceback
+        tb = traceback.format_exc()
+        log.error(f"Setup eval failed: {e}\n{tb}", exc_info=True)
         setup_eval_progress = {"phase":"error","pct":0,"message":str(e)}
+        # v23.1: record the error into the results file so we can see what went wrong
+        # (otherwise it silently overwrites the last _save_results state or stays stale).
+        try:
+            if 'results' in locals():
+                results.setdefault("_analysis_errors", {})["setup_eval"] = f"{type(e).__name__}: {e}"
+                results["_analysis_errors"]["setup_eval_trace"] = tb
+                SETUP_RESULTS_PATH.write_text(json.dumps(results, indent=2, default=str))
+                log.info("Wrote partial results with error info")
+        except Exception as e2:
+            log.error(f"Also failed to write partial results: {e2}")
     finally:
         setup_eval_in_progress = False
 
