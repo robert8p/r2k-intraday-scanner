@@ -4180,7 +4180,8 @@ def run_setup_evaluation(target_pct=0.01):
         # Ex-F_A rejects set from ex_fa_result.
         ex_fa_rejects = set()  # (setup, hour) tuples that failed ex_fa
         for h_str, hr_data in ex_fa_result.get("by_hour", {}).items():
-            for s, rec in hr_data.items():
+            # hr_data has shape {base_hit_rate, n_base, setups: {setup: {ex_fa_edge, holds_up, ...}}}
+            for s, rec in (hr_data.get("setups") or {}).items():
                 if rec.get("ex_fa_edge") is not None and not rec.get("holds_up", False):
                     ex_fa_rejects.add((s, int(h_str)))
 
