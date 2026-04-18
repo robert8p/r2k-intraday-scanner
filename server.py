@@ -4561,6 +4561,362 @@ def load_setup_results():
     try: return json.loads(SETUP_RESULTS_PATH.read_text())
     except: return None
 
+# ═══════════════════════════════════════════════════════════════════
+# v25: CONVICTION MODEL — TRAIN + CALIBRATE
+# Goal: predict the binary outcome "did stock reach scan_price × 1.01
+# before 15:55 ET close?" using all available features, and report
+# calibration by probability bucket.
+#
+# Broad scope: every (stock, scan_hour, date) with sufficient data,
+# NOT just current active setup firings. Features include bar-data,
+# cross-sectional ranks, SPY/sector relative, gap, regime, AND all
+# setup-firing flags as boolean features.
+#
+# Target: achieve an 80%+ actual hit rate in the model's
+# highest-probability bucket (with n≥30 and Wilson CI lower bound ≥75%).
+# ═══════════════════════════════════════════════════════════════════
+CONVICTION_MODEL_PATH = DATA_DIR / "conviction_model.pkl"
+CONVICTION_CALIB_PATH = DATA_DIR / "conviction_calibrator.pkl"
+CONVICTION_RESULTS_PATH = DATA_DIR / "conviction_results.json"
+conviction_train_in_progress = False
+conviction_train_progress = {"phase":"idle","pct":0,"message":""}
+
+def wilson_ci(n_success, n_total, confidence=0.95):
+    """Wilson score interval for binomial proportions. Returns (lower, upper)."""
+    if n_total == 0: return (0.0, 0.0)
+    import math
+    z = 1.96  # 95% confidence
+    p = n_success / n_total
+    denom = 1 + z*z / n_total
+    center = (p + z*z / (2*n_total)) / denom
+    spread = (z / denom) * math.sqrt(p*(1-p)/n_total + z*z/(4*n_total*n_total))
+    return (max(0.0, center - spread), min(1.0, center + spread))
+
+def run_conviction_training():
+    """
+    Train LightGBM classifier predicting `price hits +1% before 15:55` binary.
+    Uses broad scope: every (date, ticker, scan_hour) with features computable,
+    NOT filtered to setup firings. Plus setup-firing flags as features.
+    """
+    global conviction_train_in_progress, conviction_train_progress
+    if conviction_train_in_progress:
+        log.warning("conviction training already running")
+        return
+    conviction_train_in_progress = True
+    conviction_train_progress = {"phase":"starting","pct":0,"message":"Starting conviction model training..."}
+
+    try:
+        if not (BARS_DAILY_CACHE.exists() and BARS_INTRADAY_CACHE.exists()):
+            raise RuntimeError("No bar cache. Run Training first.")
+
+        conviction_train_progress = {"phase":"loading","pct":2,"message":"Loading bars..."}
+        daily_bars = pickle.loads(BARS_DAILY_CACHE.read_bytes())
+        intraday_bars = pickle.loads(BARS_INTRADAY_CACHE.read_bytes())
+
+        # Determine all trading dates from IWM (ETF, reliable daily bars)
+        iwm_daily = daily_bars.get("IWM", [])
+        if len(iwm_daily) < 200:
+            raise RuntimeError(f"Insufficient IWM daily history: {len(iwm_daily)} bars")
+        all_dates = sorted(set(b["t"][:10] for b in iwm_daily))
+        log.info(f"Conviction training: {len(all_dates)} trading dates available")
+
+        # Three-way temporal split (same as setup_eval: 60/20/20)
+        n = len(all_dates)
+        split_tr = int(n * 0.60)
+        split_va = int(n * 0.80)
+        train_dates = set(all_dates[:split_tr])
+        val_dates = set(all_dates[split_tr:split_va])
+        test_dates = set(all_dates[split_va:])
+        log.info(f"Split: train={len(train_dates)}, val={len(val_dates)}, test={len(test_dates)}")
+
+        # Build examples: for each (date, scan_hour, ticker), compute features + target
+        # This is the SAME approach as run_setup_evaluation but emits ALL stocks (not just firings)
+        # and includes setup-firing flags in the feature vector.
+
+        # Extract trading-hour bars per ticker per date
+        def bars_for_date(ticker, date):
+            return [b for b in intraday_bars.get(ticker, []) if b["t"][:10] == date]
+        def daily_up_to(ticker, date):
+            return [b for b in daily_bars.get(ticker, []) if b["t"][:10] < date]
+
+        examples = []  # list of dicts: {fold, date, hour, ticker, features, label, setup_flags}
+        from collections import defaultdict as _dd
+        scan_hours = SCAN_HOURS  # [11,12,13,14,15]
+        tickers = [t for t in TICKERS if t not in ("SPY","IWM")]
+
+        total_dates = len(all_dates)
+        for di, date in enumerate(all_dates):
+            if (di + 1) % 10 == 0:
+                pct = 5 + int((di / total_dates) * 60)
+                conviction_train_progress = {"phase":"features","pct":pct,
+                    "message":f"Building features for date {di+1}/{total_dates}..."}
+
+            # SPY / IWM context for this date (daily fetch for gap calc; intraday for regime)
+            spy_intraday_date = [b for b in intraday_bars.get("SPY", []) if b["t"][:10] == date]
+            iwm_intraday_date = [b for b in intraday_bars.get("IWM", []) if b["t"][:10] == date]
+
+            # Sector green counts (recomputed per scan hour below)
+            for scan_hour in scan_hours:
+                scan_min = scan_hour * 60  # minutes since midnight ET
+                # bars strictly before scan; bars at-or-after scan for outcome
+                # Using minutes-since-open representation:
+                # scan_minute_et = scan_hour * 60 (e.g. 11:00 = 660)
+                scan_minute_et = scan_hour * 60
+
+                # SPY context at this scan
+                spy_before = [b for b in spy_intraday_date if (bar_to_et_minutes(b) or -1) < scan_minute_et]
+                iwm_before = [b for b in iwm_intraday_date if (bar_to_et_minutes(b) or -1) < scan_minute_et]
+                spy_ctx = compute_spy_context(spy_before) if spy_before else None
+
+                # Compute sector breadth at scan: fraction of tickers in each sector that are green
+                # (close > prev_close). Used by sector_bounce setup.
+                sector_green_count = _dd(lambda: [0, 0])  # sector → [green_count, total]
+                _per_ticker_scan_price = {}
+                _per_ticker_prev_close = {}
+                _per_ticker_before_bars = {}
+                _per_ticker_after_bars = {}
+                _per_ticker_daily = {}
+                for tkr in tickers:
+                    tbars = bars_for_date(tkr, date)
+                    if len(tbars) < 6: continue
+                    tb = [b for b in tbars if (bar_to_et_minutes(b) or -1) < scan_minute_et]
+                    ta = [b for b in tbars if (bar_to_et_minutes(b) or -1) >= scan_minute_et]
+                    if len(tb) < 6 or len(ta) < 2: continue
+                    dl = daily_up_to(tkr, date)
+                    pc = dl[-1]["c"] if dl else None
+                    if pc is None: continue
+                    sp = tb[-1]["c"]
+                    tsec = SECTORS.get(tkr, "?")
+                    sector_green_count[tsec][1] += 1
+                    if sp > pc:
+                        sector_green_count[tsec][0] += 1
+                    _per_ticker_scan_price[tkr] = sp
+                    _per_ticker_prev_close[tkr] = pc
+                    _per_ticker_before_bars[tkr] = tb
+                    _per_ticker_after_bars[tkr] = ta
+                    _per_ticker_daily[tkr] = dl
+
+                # Pass 1: build per-ticker feature + setup flags + outcome
+                date_hour_rows = []
+                for ticker in _per_ticker_scan_price.keys():
+                    before = _per_ticker_before_bars[ticker]
+                    after = _per_ticker_after_bars[ticker]
+                    scan_price = _per_ticker_scan_price[ticker]
+                    prev_close = _per_ticker_prev_close[ticker]
+                    open_price = before[0]["o"]
+                    dl = _per_ticker_daily[ticker]
+
+                    # Compute features
+                    feat = compute_features(before, dl, scan_price, open_price, scan_hour,
+                                            spy_context=spy_ctx, prev_close=prev_close)
+                    if feat is None: continue
+
+                    # Setup firings at this scan
+                    sec = SECTORS.get(ticker, "?")
+                    sgc = sector_green_count[sec]
+                    breadth = sgc[0] / sgc[1] if sgc[1] > 0 else 0
+                    active = detect_setups(before, scan_price, prev_close,
+                                           sector_breadth=breadth,
+                                           prior_daily=dl, iwm_bars=iwm_before,
+                                           scan_minute_et=scan_minute_et)
+                    setup_flags = {f"setup_{s}": int(bool(active[s])) for s in SETUP_NAMES}
+
+                    # Target: did price reach +1% before 15:55?
+                    # after bars include scan bar itself at index 0; actual future is after[1:]
+                    hit, pnl = did_hit_target(scan_price, after[1:], target_pct=0.01)
+
+                    date_hour_rows.append({
+                        "date": date, "hour": scan_hour, "ticker": ticker, "sector": sec,
+                        "feat": feat, "setup_flags": setup_flags,
+                        "label": 1 if hit else 0,
+                    })
+
+                if len(date_hour_rows) < 10: continue
+                # Add cross-sectional ranks + sector-relative features
+                feats_list = [r["feat"] for r in date_hour_rows]
+                sectors_list = [r["sector"] for r in date_hour_rows]
+                add_ranks(feats_list)
+                add_sector_relative(feats_list, sectors_list)
+
+                # Emit examples
+                fold = "train" if date in train_dates else ("val" if date in val_dates else "test")
+                for r in date_hour_rows:
+                    examples.append({
+                        "fold": fold, "date": date, "hour": scan_hour, "ticker": r["ticker"],
+                        "feat": r["feat"], "setup_flags": r["setup_flags"], "label": r["label"],
+                    })
+
+        log.info(f"Built {len(examples)} examples total")
+        conviction_train_progress = {"phase":"vectorize","pct":70,
+            "message":f"Vectorizing {len(examples)} examples..."}
+
+        # Build feature matrix
+        # Base features + setup flags
+        base_feat_names = FEATURE_NAMES
+        setup_feat_names = [f"setup_{s}" for s in SETUP_NAMES]
+        all_feat_names = base_feat_names + setup_feat_names + ["hour_11","hour_12","hour_13","hour_14","hour_15"]
+
+        def row_to_vec(ex):
+            f = ex["feat"]
+            v = [float(f.get(k, 0.0) or 0.0) for k in base_feat_names]
+            v += [float(ex["setup_flags"].get(k, 0)) for k in setup_feat_names]
+            # Hour one-hot
+            v += [1.0 if ex["hour"] == h else 0.0 for h in [11,12,13,14,15]]
+            return v
+
+        X_train, y_train = [], []
+        X_val, y_val = [], []
+        X_test, y_test = [], []
+        meta_test = []  # keep track of test (date, hour, ticker) for inspection
+        for ex in examples:
+            vec = row_to_vec(ex)
+            if ex["fold"] == "train":
+                X_train.append(vec); y_train.append(ex["label"])
+            elif ex["fold"] == "val":
+                X_val.append(vec); y_val.append(ex["label"])
+            else:
+                X_test.append(vec); y_test.append(ex["label"])
+                meta_test.append({"date": ex["date"], "hour": ex["hour"], "ticker": ex["ticker"]})
+
+        X_train = np.array(X_train, dtype=np.float32)
+        y_train = np.array(y_train, dtype=np.int32)
+        X_val = np.array(X_val, dtype=np.float32)
+        y_val = np.array(y_val, dtype=np.int32)
+        X_test = np.array(X_test, dtype=np.float32)
+        y_test = np.array(y_test, dtype=np.int32)
+
+        log.info(f"Matrix shapes: train={X_train.shape}, val={X_val.shape}, test={X_test.shape}")
+        log.info(f"Base rates: train={y_train.mean():.3f}, val={y_val.mean():.3f}, test={y_test.mean():.3f}")
+
+        if len(X_train) < 1000 or len(X_val) < 200:
+            raise RuntimeError(f"Insufficient examples: train={len(X_train)}, val={len(X_val)}")
+
+        conviction_train_progress = {"phase":"training","pct":80,"message":"Training LightGBM..."}
+        # Train LightGBM classifier
+        train_ds = lgb.Dataset(X_train, label=y_train, feature_name=all_feat_names)
+        val_ds = lgb.Dataset(X_val, label=y_val, feature_name=all_feat_names, reference=train_ds)
+        params = {
+            "objective": "binary",
+            "metric": "binary_logloss",
+            "learning_rate": 0.05,
+            "num_leaves": 31,
+            "min_data_in_leaf": 50,
+            "feature_fraction": 0.9,
+            "bagging_fraction": 0.85,
+            "bagging_freq": 5,
+            "lambda_l2": 1.0,
+            "verbose": -1,
+        }
+        model = lgb.train(
+            params, train_ds,
+            num_boost_round=500,
+            valid_sets=[val_ds], valid_names=["val"],
+            callbacks=[lgb.early_stopping(30), lgb.log_evaluation(0)],
+        )
+        log.info(f"Trained LightGBM, best iteration: {model.best_iteration}")
+
+        # Get raw predictions on val fold for calibration
+        raw_val = model.predict(X_val, num_iteration=model.best_iteration)
+        # Fit isotonic regression calibrator on val fold
+        calibrator = IsotonicRegression(out_of_bounds="clip")
+        calibrator.fit(raw_val, y_val)
+
+        # Apply to test
+        conviction_train_progress = {"phase":"evaluating","pct":90,"message":"Evaluating on test fold..."}
+        raw_test = model.predict(X_test, num_iteration=model.best_iteration)
+        calib_test = calibrator.transform(raw_test)
+
+        # Test-fold overall metrics
+        from sklearn.metrics import roc_auc_score as _auc
+        try:
+            auc_test = _auc(y_test, raw_test)
+        except Exception:
+            auc_test = None
+
+        # Bucket by calibrated probability
+        buckets = [
+            (0.0, 0.3, "0.0-0.3"),
+            (0.3, 0.4, "0.3-0.4"),
+            (0.4, 0.5, "0.4-0.5"),
+            (0.5, 0.6, "0.5-0.6"),
+            (0.6, 0.7, "0.6-0.7"),
+            (0.7, 0.8, "0.7-0.8"),
+            (0.8, 0.9, "0.8-0.9"),
+            (0.9, 1.01, "0.9+"),
+        ]
+        bucket_stats = []
+        for lo, hi, label in buckets:
+            mask = (calib_test >= lo) & (calib_test < hi)
+            n = int(mask.sum())
+            if n == 0:
+                bucket_stats.append({
+                    "bucket": label, "n": 0, "n_hits": 0,
+                    "hit_rate_pct": None, "ci_lower_pct": None, "ci_upper_pct": None,
+                    "mean_predicted_prob": None,
+                })
+                continue
+            hits = int(y_test[mask].sum())
+            lower, upper = wilson_ci(hits, n)
+            bucket_stats.append({
+                "bucket": label, "n": n, "n_hits": hits,
+                "hit_rate_pct": round(hits / n * 100, 2),
+                "ci_lower_pct": round(lower * 100, 2),
+                "ci_upper_pct": round(upper * 100, 2),
+                "mean_predicted_prob": round(float(calib_test[mask].mean()), 3),
+            })
+
+        # Verdict
+        # Pass: any bucket with label >= 0.8 has n>=30 and ci_lower >= 75
+        pass_buckets = []
+        for b in bucket_stats:
+            if b["bucket"] in ("0.8-0.9", "0.9+") and b["n"] is not None and b["n"] >= 30 and b["ci_lower_pct"] is not None and b["ci_lower_pct"] >= 75:
+                pass_buckets.append(b)
+        verdict = "ACHIEVES_80_HIGH_CONFIDENCE" if pass_buckets else "DOES_NOT_ACHIEVE_80"
+
+        # Feature importance
+        importance_raw = model.feature_importance(importance_type="gain")
+        feat_imp = sorted(
+            [(name, float(imp)) for name, imp in zip(all_feat_names, importance_raw)],
+            key=lambda x: -x[1]
+        )
+        total_imp = sum(i for _, i in feat_imp) or 1
+        feat_imp_pct = [(n, round(i / total_imp * 100, 2)) for n, i in feat_imp]
+
+        results = {
+            "generated_at": datetime.now(ET).isoformat(),
+            "fold_sizes": {"train": len(X_train), "val": len(X_val), "test": len(X_test)},
+            "base_rates": {
+                "train": round(float(y_train.mean()) * 100, 2),
+                "val": round(float(y_val.mean()) * 100, 2),
+                "test": round(float(y_test.mean()) * 100, 2),
+            },
+            "auc_test": round(auc_test, 4) if auc_test is not None else None,
+            "buckets": bucket_stats,
+            "verdict": verdict,
+            "top_features": feat_imp_pct[:30],
+            "best_iteration": model.best_iteration,
+            "n_features": len(all_feat_names),
+        }
+        CONVICTION_RESULTS_PATH.write_text(json.dumps(results, indent=2, default=str))
+
+        # Save model + calibrator for potential live use
+        with open(CONVICTION_MODEL_PATH, "wb") as f:
+            pickle.dump(model, f)
+        with open(CONVICTION_CALIB_PATH, "wb") as f:
+            pickle.dump(calibrator, f)
+
+        log.info(f"Conviction model training complete. Verdict: {verdict}. AUC: {auc_test}")
+        conviction_train_progress = {"phase":"done","pct":100,
+            "message":f"Done. Verdict: {verdict}. AUC test: {auc_test}"}
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        log.error(f"Conviction training failed: {e}\n{tb}", exc_info=True)
+        conviction_train_progress = {"phase":"error","pct":0,"message":str(e)}
+    finally:
+        conviction_train_in_progress = False
+
+
 # Evidence-quality thresholds for declaring a setup tradable at a given hour.
 # A setup is "active" only at scan hours where it survived test-fold evaluation.
 # These thresholds are deliberately conservative.
@@ -5550,6 +5906,31 @@ def trigger_setup_evaluation(bg: BackgroundTasks):
         return JSONResponse({"error":"Bar cache missing. Run Training first."},400)
     bg.add_task(run_setup_evaluation)
     return {"status":"started"}
+
+# v25: conviction model training endpoints
+@app.post("/api/conviction/train")
+def trigger_conviction_training(bg: BackgroundTasks):
+    if conviction_train_in_progress: return {"status":"already_running"}
+    if training_in_progress or setup_eval_in_progress:
+        return JSONResponse({"error":"Another task running"},400)
+    if not (BARS_DAILY_CACHE.exists() and BARS_INTRADAY_CACHE.exists()):
+        return JSONResponse({"error":"Bar cache missing"},400)
+    bg.add_task(run_conviction_training)
+    return {"status":"started"}
+
+@app.get("/api/conviction/progress")
+def conviction_progress_endpoint():
+    return {"inProgress":conviction_train_in_progress, **conviction_train_progress}
+
+@app.get("/api/conviction/results")
+def conviction_results_endpoint():
+    if not CONVICTION_RESULTS_PATH.exists():
+        return {"status":"no_results"}
+    try:
+        return json.loads(CONVICTION_RESULTS_PATH.read_text())
+    except Exception as e:
+        return JSONResponse({"error":str(e)},500)
+
 
 @app.post("/api/setup/reset")
 def reset_setup():

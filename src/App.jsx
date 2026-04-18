@@ -513,6 +513,21 @@ function TrainingTab() {
     return ()=>clearInterval(iv);
   },[pollRepair]);
 
+  // v25: conviction model training state
+  const [convProg, setConvProg] = useState(null);
+  const [convResults, setConvResults] = useState(null);
+  const pollConv = useCallback(()=>{
+    fetch('/api/conviction/progress').then(r=>r.json()).then(setConvProg).catch(()=>{});
+    fetch('/api/conviction/results').then(r=>r.json()).then(d=>{
+      if (d && !d.status) setConvResults(d);
+    }).catch(()=>{});
+  },[]);
+  useEffect(()=>{
+    pollConv();
+    const iv=setInterval(pollConv, 3000);
+    return ()=>clearInterval(iv);
+  },[pollConv]);
+
   const trigTrain=async()=>{
     await fetch('/api/train',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({tp_mult:tp,sl_mult:sl})});
@@ -537,6 +552,13 @@ function TrainingTab() {
     const d=await r.json();
     if(d.error) alert(`Error: ${d.error}`);
     pollRepair();
+  };
+  const trainConvictionModel=async()=>{
+    if(!confirm("Train conviction model? This builds features for every (date × stock × scan hour) in 2 years of data, trains LightGBM to predict `hit +1% before close` binary, and reports calibration by probability bucket. Takes ~15-30 minutes.")) return;
+    const r=await fetch('/api/conviction/train',{method:'POST'});
+    const d=await r.json();
+    if(d.error) alert(`Error: ${d.error}`);
+    pollConv();
   };
 
   if(ld) return <div style={{color:"#475569",padding:40,textAlign:"center"}}>Loading...</div>;
@@ -717,6 +739,130 @@ function TrainingTab() {
             )}
           </div>
         </div>
+      </Box>
+
+      {/* v25: CONVICTION MODEL — train & calibrate */}
+      <Box>
+        <Lbl>Conviction Model (v25) — train classifier + report calibration by probability bucket</Lbl>
+        <div style={{fontSize:10,color:"#475569",marginBottom:10,lineHeight:1.5}}>
+          Trains a LightGBM binary classifier on the full 2-year dataset (every date × stock × scan hour, NOT just setup firings). Target: <b>did price hit scan × 1.01 before 15:55 ET close?</b> Uses 36 base features + 20 setup-firing flags + scan-hour one-hots. Three-way temporal split. Isotonic calibration on val fold. Reports calibration buckets on held-out test fold with Wilson 95% confidence intervals. <b>Pass condition: n≥30 in 0.8-0.9 or 0.9+ bucket AND CI lower bound ≥75%.</b>
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:10}}>
+          <Btn onClick={trainConvictionModel} disabled={convProg?.inProgress||ip||extProg?.inProgress||repairProg?.inProgress} color="#8b5cf6" style={{padding:"8px 16px",fontSize:12}}>
+            {convProg?.inProgress?"Training...":"Train Conviction Model"}
+          </Btn>
+          {convResults && !convProg?.inProgress && (
+            <span style={{fontSize:11,color:"#64748b"}}>
+              Last trained: {convResults.generated_at?.slice(0,19).replace("T"," ")}
+            </span>
+          )}
+        </div>
+        {convProg?.inProgress && (
+          <div style={{marginTop:10,marginBottom:10}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+              <div style={{flex:1,height:6,background:"rgba(255,255,255,0.06)",borderRadius:3,overflow:"hidden"}}>
+                <div style={{width:`${convProg.pct||0}%`,height:"100%",background:"#8b5cf6",borderRadius:3,transition:"width 0.5s"}}/>
+              </div>
+              <span style={{fontSize:11,color:"#8b5cf6",fontWeight:600}}>{convProg.pct||0}%</span>
+            </div>
+            <div style={{fontSize:11,color:"#64748b"}}>{convProg.message}</div>
+          </div>
+        )}
+        {!convProg?.inProgress && convProg?.phase === "error" && (
+          <div style={{marginTop:10,padding:"6px 10px",borderRadius:4,background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.2)"}}>
+            <div style={{fontSize:11,color:"#fca5a5",fontWeight:600}}>✗ {convProg.message}</div>
+          </div>
+        )}
+        {convResults && (
+          <div style={{marginTop:14}}>
+            {/* Verdict */}
+            <div style={{marginBottom:12,padding:"8px 12px",borderRadius:4,
+              background: convResults.verdict==="ACHIEVES_80_HIGH_CONFIDENCE"?"rgba(34,197,94,0.08)":"rgba(234,179,8,0.08)",
+              border: `1px solid ${convResults.verdict==="ACHIEVES_80_HIGH_CONFIDENCE"?"rgba(34,197,94,0.25)":"rgba(234,179,8,0.25)"}`}}>
+              <span style={{fontSize:11,color:"#64748b",fontWeight:600,textTransform:"uppercase",letterSpacing:0.3}}>Verdict</span>
+              <span style={{marginLeft:10,color: convResults.verdict==="ACHIEVES_80_HIGH_CONFIDENCE"?"#22c55e":"#eab308",fontWeight:700,letterSpacing:0.3}}>{convResults.verdict}</span>
+              <span style={{marginLeft:16,color:"#94a3b8",fontSize:11}}>
+                AUC test: <b>{convResults.auc_test ?? "—"}</b>
+                {"  ·  "}
+                Features: <b>{convResults.n_features}</b>
+                {"  ·  "}
+                Best iter: <b>{convResults.best_iteration}</b>
+              </span>
+            </div>
+
+            {/* Fold sizes + base rates */}
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(120px,1fr))",gap:8,marginBottom:14}}>
+              {["train","val","test"].map(f=>{
+                const n = convResults.fold_sizes?.[f];
+                const br = convResults.base_rates?.[f];
+                return <div key={f} style={{padding:"8px 10px",borderRadius:4,background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.04)"}}>
+                  <div style={{fontSize:9,color:"#64748b",fontWeight:600,letterSpacing:0.3,textTransform:"uppercase",marginBottom:3}}>{f}</div>
+                  <div style={{fontSize:13,color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>
+                    <b>{n?.toLocaleString() ?? "—"}</b> <span style={{color:"#64748b",fontSize:11}}>examples</span>
+                  </div>
+                  <div style={{fontSize:11,color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>
+                    base rate: <b>{br ?? "—"}%</b>
+                  </div>
+                </div>;
+              })}
+            </div>
+
+            {/* Calibration buckets */}
+            <div style={{fontSize:10,color:"#94a3b8",fontWeight:600,textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>Calibration Buckets (TEST fold)</div>
+            <table style={{width:"100%",fontSize:11,borderCollapse:"collapse",marginBottom:14}}>
+              <thead><tr>
+                {["Bucket","n","Hit%","CI 95%","Mean Predicted","Status"].map(col=>
+                  <th key={col} style={{padding:"4px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase"}}>{col}</th>)}
+              </tr></thead>
+              <tbody>
+                {(convResults.buckets||[]).map((b,bi)=>{
+                  const isHighConv = b.bucket==="0.8-0.9" || b.bucket==="0.9+";
+                  const passes = isHighConv && b.n>=30 && b.ci_lower_pct!=null && b.ci_lower_pct>=75;
+                  const hr = b.hit_rate_pct;
+                  const hrColor = hr==null?"#64748b":hr>=75?"#22c55e":hr>=60?"#a3e635":hr>=50?"#eab308":hr>=40?"#94a3b8":"#ef4444";
+                  return <tr key={bi} style={{borderTop:"1px solid rgba(255,255,255,0.04)",background:isHighConv?"rgba(139,92,246,0.04)":"transparent"}}>
+                    <td style={{padding:"4px 8px",color:isHighConv?"#c4b5fd":"#e2e8f0",fontWeight:isHighConv?600:400}}>{b.bucket}</td>
+                    <td style={{padding:"4px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{b.n}</td>
+                    <td style={{padding:"4px 8px",color:hrColor,fontVariantNumeric:"tabular-nums",fontWeight:600}}>{hr!=null?`${hr}%`:"—"}</td>
+                    <td style={{padding:"4px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums",fontSize:10}}>
+                      {b.ci_lower_pct!=null && b.ci_upper_pct!=null ? `[${b.ci_lower_pct}%, ${b.ci_upper_pct}%]` : "—"}
+                    </td>
+                    <td style={{padding:"4px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{b.mean_predicted_prob!=null?`${(b.mean_predicted_prob*100).toFixed(1)}%`:"—"}</td>
+                    <td style={{padding:"4px 8px",fontWeight:600,fontSize:10,letterSpacing:0.3}}>
+                      {passes ? <span style={{color:"#22c55e"}}>✓ PASSES 80% BAR</span> : (isHighConv && b.n>0 ? <span style={{color:"#eab308"}}>✗ below bar</span> : "")}
+                    </td>
+                  </tr>;
+                })}
+              </tbody>
+            </table>
+
+            {/* Top features */}
+            <details>
+              <summary style={{cursor:"pointer",fontSize:11,color:"#94a3b8",fontWeight:600,textTransform:"uppercase",letterSpacing:0.3}}>Top 30 feature importances (click to expand)</summary>
+              <table style={{width:"100%",fontSize:11,borderCollapse:"collapse",marginTop:8}}>
+                <thead><tr>
+                  {["Feature","Importance %"].map(col=>
+                    <th key={col} style={{padding:"3px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase"}}>{col}</th>)}
+                </tr></thead>
+                <tbody>
+                  {(convResults.top_features||[]).map(([name,pct],fi)=>
+                    <tr key={fi} style={{borderTop:"1px solid rgba(255,255,255,0.03)"}}>
+                      <td style={{padding:"3px 8px",color:"#e2e8f0"}}>{name}</td>
+                      <td style={{padding:"3px 8px",color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>
+                        <div style={{display:"flex",alignItems:"center",gap:6}}>
+                          <div style={{width:100,height:5,background:"rgba(255,255,255,0.05)",borderRadius:2,overflow:"hidden"}}>
+                            <div style={{width:`${Math.min(100,pct*2)}%`,height:"100%",background:"#8b5cf6"}}/>
+                          </div>
+                          <span>{pct}%</span>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </details>
+          </div>
+        )}
       </Box>
 
       {Object.keys(meta).length>0&&(
