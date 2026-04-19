@@ -199,6 +199,11 @@ last_scans = {}
 training_in_progress = False
 training_progress = {"phase":"idle","pct":0,"message":""}
 
+# v33: deployment model (loaded from disk at startup if saved by v29)
+v33_deploy_model = None
+v33_deploy_calibrator = None
+v33_deploy_meta = None
+
 # v17: extend history (fetch older bars to enrich cache without retraining)
 extend_history_in_progress = False
 extend_history_progress = {"phase":"idle","pct":0,"message":""}
@@ -232,6 +237,23 @@ def load_models():
         if mtp.exists():
             model_meta[h] = json.loads(mtp.read_text())
 load_models()
+
+def load_v33_deploy():
+    """v33: load the conviction deployment model (trained for +0.32% target by v29)."""
+    global v33_deploy_model, v33_deploy_calibrator, v33_deploy_meta
+    try:
+        if V33_MODEL_PATH.exists() and V33_CALIB_PATH.exists() and V33_META_PATH.exists():
+            with open(V33_MODEL_PATH, "rb") as f:
+                v33_deploy_model = pickle.load(f)
+            with open(V33_CALIB_PATH, "rb") as f:
+                v33_deploy_calibrator = pickle.load(f)
+            v33_deploy_meta = json.loads(V33_META_PATH.read_text())
+            log.info(f"v33 deploy model loaded: target={v33_deploy_meta.get('target_label')}, AUC={v33_deploy_meta.get('auc_test')}")
+        else:
+            log.info("v33 deploy model not present (run v29 to train and save it)")
+    except Exception as e:
+        log.error(f"Failed to load v33 deploy model: {e}")
+# Called later (after V33_MODEL_PATH etc are defined)
 
 # ─── v7 migration: clear analysis artifacts generated with old two-way split ──
 # Threshold, patterns, and sensitivity results from v6 and earlier assumed an
@@ -5801,8 +5823,17 @@ def run_v28_cost_adjusted():
 # point is between these values. This sweep pinpoints it.
 # ═══════════════════════════════════════════════════════════════════
 V29_RESULTS_PATH = DATA_DIR / "v29_target_sweep_results.json"
+
+# v33: deployment model artifacts saved by v29 (highest-passing target = +0.32%)
+V33_MODEL_PATH = DATA_DIR / "conviction_v33_model.pkl"
+V33_CALIB_PATH = DATA_DIR / "conviction_v33_calibrator.pkl"
+V33_META_PATH = DATA_DIR / "conviction_v33_meta.json"
+V33_DEPLOY_TARGET_PCT = 0.0032  # +0.32%
 v29_in_progress = False
 v29_progress = {"phase":"idle","pct":0,"message":""}
+
+# Load the v33 deployment model now that paths exist
+load_v33_deploy()
 
 def run_v29_target_sweep():
     """Sweep 0.31% through 0.40% at 1bps increments, LightGBM classifier each."""
@@ -6024,6 +6055,41 @@ def run_v29_target_sweep():
                 "passing_buckets": [b["bucket"] for b in pass_buckets],
             }
             log.info(f"v29 {tlabel}: AUC={auc_test}, verdict={verdict}, passing={[b['bucket'] for b in pass_buckets]}")
+
+            # v33: save the deployment model when we train the target we want to deploy (+0.32%)
+            if abs(tp - V33_DEPLOY_TARGET_PCT) < 1e-6:
+                try:
+                    with open(V33_MODEL_PATH, "wb") as f:
+                        pickle.dump(model, f)
+                    with open(V33_CALIB_PATH, "wb") as f:
+                        pickle.dump(calibrator, f)
+                    deploy_meta = {
+                        "saved_at": datetime.now(ET).isoformat(),
+                        "target_pct": V33_DEPLOY_TARGET_PCT,
+                        "target_label": tlabel,
+                        "feature_names": all_feat_names_lgbm,
+                        "n_features": len(all_feat_names_lgbm),
+                        "auc_test": auc_test,
+                        "verdict": verdict,
+                        "buckets": bucket_stats,
+                        "base_rate_test": round(float(y_test.mean()) * 100, 2),
+                        "best_iteration": model.best_iteration,
+                        "fold_sizes": {"train": int(len(X_train)), "val": int(len(X_val)), "test": int(len(X_test))},
+                        "note": ("Deployment model for live scanner. Trained by v29 for the +0.32% target."
+                                 " Uses 61 features (bar features + setup flags + hour one-hots, same schema as v28/v29)."
+                                 " Regime-dependent: v32 showed that SPY-context features drive the model's"
+                                 " ability to concentrate mass at prob>=0.9. Expect firings to cluster on"
+                                 " specific market-regime days, with many days producing zero signals."),
+                    }
+                    V33_META_PATH.write_text(json.dumps(deploy_meta, indent=2, default=str))
+                    # Also reload into live memory so running server picks up the new model
+                    global v33_deploy_model, v33_deploy_calibrator, v33_deploy_meta
+                    v33_deploy_model = model
+                    v33_deploy_calibrator = calibrator
+                    v33_deploy_meta = deploy_meta
+                    log.info(f"v33 deployment model SAVED for {tlabel} target. Live scanner will score stocks against this.")
+                except Exception as e:
+                    log.error(f"Failed to save v33 deployment model: {e}")
 
         # Summary: find highest passing target
         passing_labels = [tl for tl in TARGET_LABELS
@@ -7094,10 +7160,56 @@ def run_live_scan(scan_hour):
     raw_probs = models[scan_hour].predict(X)
     cal_probs = calibrators[scan_hour].predict(raw_probs) if scan_hour in calibrators else raw_probs
 
+    # v33: score every stock with the conviction deployment model (+0.32% target).
+    # Produces a calibrated probability that price will reach +0.32% before close.
+    # Feature vector schema: FEATURE_NAMES + setup_flags + hour one-hots = 61 features.
+    v33_probs = None
+    v33_raw_probs = None
+    if v33_deploy_model is not None and v33_deploy_calibrator is not None and v33_deploy_meta is not None:
+        try:
+            deploy_feat_names = v33_deploy_meta.get("feature_names", [])
+            base_feat_names_v33 = FEATURE_NAMES
+            setup_feat_names_v33 = [f"setup_{s}" for s in SETUP_NAMES]
+
+            # Build feature matrix: for each stock, compute setup_flags too (needed for v33 vec)
+            v33_X = []
+            for i, si in enumerate(stock_info):
+                rf = raw_feats[i]
+                ticker = si["ticker"]
+                before = per_stock_bars_before.get(ticker, [])
+                prev_close = per_stock_prev_close.get(ticker)
+                prior_daily = per_stock_prior_daily.get(ticker, [])
+                sec = si["sector"]
+                sc = sector_counts[sec]
+                breadth = sc[0]/sc[1] if sc[1] > 0 else 0
+                active = detect_setups(
+                    before, si["price"], prev_close,
+                    sector_breadth=breadth,
+                    prior_daily=prior_daily,
+                    iwm_bars=iwm_before,
+                    scan_minute_et=scan_min,
+                )
+                vec = [float(rf.get(k, 0.0) or 0.0) for k in base_feat_names_v33]
+                vec += [float(1 if active.get(s.replace("setup_", ""), False) else 0) for s in setup_feat_names_v33]
+                vec += [1.0 if scan_hour == h else 0.0 for h in [11, 12, 13, 14, 15]]
+                v33_X.append(vec)
+            v33_X_np = np.array(v33_X, dtype=np.float32)
+            # Validate feature count matches schema
+            if v33_X_np.shape[1] == len(deploy_feat_names):
+                v33_raw_probs = v33_deploy_model.predict(v33_X_np, num_iteration=v33_deploy_model.best_iteration)
+                v33_probs = v33_deploy_calibrator.transform(v33_raw_probs)
+            else:
+                log.warning(f"v33 feature count mismatch: built {v33_X_np.shape[1]}, model expects {len(deploy_feat_names)}")
+        except Exception as e:
+            log.error(f"v33 scoring failed: {e}")
+            v33_probs = None
+
     results = []
     for i in range(len(raw_feats)):
         si, rf = stock_info[i], raw_feats[i]
         wp = float(cal_probs[i])
+        # v33: conviction probability for +0.32% target
+        v33_prob = float(v33_probs[i]) if v33_probs is not None else None
         # Per-stock barriers in percent terms
         stock_tp_pct = active_tp_mult * si["atr_pct"]
         stock_sl_pct = active_sl_mult * si["atr_pct"]
@@ -7136,6 +7248,8 @@ def run_live_scan(scan_hour):
             "rawScore":round(float(raw_probs[i]),4),
             "patternMatch":pattern_summary,
             "clearsThreshold":clears_threshold,
+            # v33: conviction model probability for +0.32% target (None if model not loaded)
+            "convictionV33Prob": round(v33_prob, 4) if v33_prob is not None else None,
             # v8: per-stock volatility-adjusted barriers
             "atrPct": round(si["atr_pct"]*100, 3),
             "tpPct": round(stock_tp_pct*100, 3),
@@ -7180,6 +7294,11 @@ def run_live_scan(scan_hour):
         for m in r.get("setupMatches", []):
             setup_firing_counts[m["name"]] += 1
 
+    # v33: conviction regime summary — count stocks at high conviction tiers
+    n_conv_90 = sum(1 for r in results if r.get("convictionV33Prob") is not None and r["convictionV33Prob"] >= 0.9)
+    n_conv_80 = sum(1 for r in results if r.get("convictionV33Prob") is not None and r["convictionV33Prob"] >= 0.8)
+    v33_available = v33_deploy_model is not None and v33_deploy_meta is not None
+
     scan_result = {
         "data":results,"timestamp":datetime.now(ET).isoformat(),"source":"live",
         "elapsed":elapsed,"scanHour":scan_hour,
@@ -7203,6 +7322,11 @@ def run_live_scan(scan_hour):
         "r2kBreadthLabel": r2k_breadth_label,
         "r2kGreenStocks": green_stocks,
         "r2kTotalStocks": total_stocks,
+        # v33: conviction model deployment status + signal counts
+        "v33Available": v33_available,
+        "v33Target": v33_deploy_meta.get("target_label") if v33_deploy_meta else None,
+        "v33HighConv90Count": n_conv_90,
+        "v33HighConv80Count": n_conv_80,
     }
 
     # v10/v13: persist each setup firing to SETUP_FIRING_LOG for live-validation tracking.
@@ -7667,6 +7791,17 @@ def v29_results_endpoint():
         return {"status":"no_results"}
     try:
         return json.loads(V29_RESULTS_PATH.read_text())
+    except Exception as e:
+        return JSONResponse({"error":str(e)},500)
+
+# v33: deployment model metadata endpoint — tells UI whether v33 model is available and its stats
+@app.get("/api/v33/meta")
+def v33_meta_endpoint():
+    if not V33_META_PATH.exists():
+        return {"available": False, "message": "v33 deployment model not trained yet. Run v29 to generate it."}
+    try:
+        meta = json.loads(V33_META_PATH.read_text())
+        return {"available": True, "meta": meta, "live_model_loaded": v33_deploy_model is not None}
     except Exception as e:
         return JSONResponse({"error":str(e)},500)
 

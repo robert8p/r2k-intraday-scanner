@@ -139,20 +139,67 @@ function ScannerTab({data,scanHour,source,elapsed,message,modelWR10,modelPnL10,h
     : mode==="be" ? data.filter(s=>s.winProb>=beThresh)
     : mode==="be5" ? data.filter(s=>s.winProb>=beThresh5)
     : mode==="posEV" ? data.filter(s=>s.ev>0)
+    : mode==="conv90" ? [...data].filter(s=>s.convictionV33Prob != null && s.convictionV33Prob >= 0.9).sort((a,b)=>b.convictionV33Prob-a.convictionV33Prob)
+    : mode==="conv80" ? [...data].filter(s=>s.convictionV33Prob != null && s.convictionV33Prob >= 0.8).sort((a,b)=>b.convictionV33Prob-a.convictionV33Prob)
     : data.slice(0, mode==="top10"?10:20);
   const posEV = data.filter(s=>s.ev>0);
   const tradable = data.filter(s=>s.tradable);
   const withSetup = data.filter(s=>s.setupMatches && s.setupMatches.length>0);
   const highConv = data.filter(s=>convictionScore(s.setupMatches) >= 2);
+  const highConv90 = data.filter(s=>s.convictionV33Prob != null && s.convictionV33Prob >= 0.9);
+  const highConv80 = data.filter(s=>s.convictionV33Prob != null && s.convictionV33Prob >= 0.8);
+  const v33Available = scanInfo?.v33Available;
   const avgEV = posEV.length>0 ? posEV.reduce((s,r)=>s+r.ev,0)/posEV.length : 0;
 
   return (
     <div>
+      {/* v33: high-conviction regime banner — shown when v33 model is loaded */}
+      {v33Available && (()=>{
+        const n90 = highConv90.length;
+        const n80 = highConv80.length;
+        const target = scanInfo?.v33Target || "0.32%";
+        let bg, border, col, lbl, msg;
+        if (n90 >= 5) {
+          bg = "rgba(34,197,94,0.08)"; border = "rgba(34,197,94,0.3)"; col = "#22c55e";
+          lbl = "HIGH-CONVICTION REGIME";
+          msg = `${n90} signals @ ≥90% conviction · ${n80} @ ≥80% · +${target} target`;
+        } else if (n90 >= 1) {
+          bg = "rgba(234,179,8,0.06)"; border = "rgba(234,179,8,0.25)"; col = "#eab308";
+          lbl = "PARTIAL REGIME";
+          msg = `${n90} signal${n90===1?"":"s"} @ ≥90% · ${n80} @ ≥80% · +${target} target · caution — below typical regime-day count`;
+        } else if (n80 >= 1) {
+          bg = "rgba(148,163,184,0.05)"; border = "rgba(148,163,184,0.2)"; col = "#94a3b8";
+          lbl = "WEAK SIGNAL";
+          msg = `${n80} signal${n80===1?"":"s"} @ ≥80% conviction · no ≥90% signals · +${target} target`;
+        } else {
+          bg = "rgba(100,116,139,0.04)"; border = "rgba(100,116,139,0.15)"; col = "#64748b";
+          lbl = "NO HIGH-CONVICTION SIGNALS";
+          msg = `Regime not favorable for +${target} LightGBM model today. Setup-based scanner still active below.`;
+        }
+        return (
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12,padding:"8px 12px",borderRadius:4,background:bg,border:`1px solid ${border}`}}>
+            <span style={{fontSize:10,color:col,fontWeight:700,letterSpacing:0.5,textTransform:"uppercase",padding:"2px 6px",background:`${col}18`,borderRadius:2}}>{lbl}</span>
+            <span style={{fontSize:11,color:"#94a3b8"}}>{msg}</span>
+          </div>
+        );
+      })()}
+
       <div style={{display:"flex",gap:12,alignItems:"center",marginBottom:16,flexWrap:"wrap"}}>
         <div style={{display:"flex",alignItems:"center",gap:6}}>
           <span style={{fontSize:10,color:"#475569",textTransform:"uppercase",letterSpacing:0.5}}>Show</span>
           {[["setup","★ Setup Active"],["conv2","★★ Conv≥2"],["tradable","✓ Tradable"],["posEV","+EV"],["be",`Win>${(beThresh*100).toFixed(0)}%`],["be5",`Win>${(beThresh5*100).toFixed(0)}%`],["top10","Top 10"],["top20","Top 20"]].map(([m,l])=>
             <Btn key={m} active={mode===m} onClick={()=>setMode(m)} color={m==="setup"?"#a855f7":m==="conv2"?"#d946ef":m==="tradable"?"#06b6d4":undefined}>{l}</Btn>)}
+          {v33Available && (
+            <>
+              <span style={{fontSize:10,color:"#334155",marginLeft:6}}>|</span>
+              <Btn active={mode==="conv90"} onClick={()=>setMode("conv90")} color="#10b981">
+                High Conv ≥90%{highConv90.length>0?` (${highConv90.length})`:""}
+              </Btn>
+              <Btn active={mode==="conv80"} onClick={()=>setMode("conv80")} color="#14b8a6">
+                High Conv ≥80%{highConv80.length>0?` (${highConv80.length})`:""}
+              </Btn>
+            </>
+          )}
         </div>
         {scanInfo?.r2kBreadthLabel && (() => {
           const bl = scanInfo.r2kBreadthLabel;
@@ -224,6 +271,20 @@ function ScannerTab({data,scanHour,source,elapsed,message,modelWR10,modelPnL10,h
             "No stocks currently clear the ML threshold. (Note: ML threshold gating is deprecated — use ★ Setup Active instead.)"
           ) : mode==="posEV" ? (
             "No stocks with positive EV at this scan hour. (Note: EV is from the deprecated ML model — use ★ Setup Active to see setup firings.)"
+          ) : mode==="conv90" ? (
+            <>
+              <div>No stocks at ≥90% v33 conviction at {scanHour}:00 ET.</div>
+              <div style={{marginTop:6,fontSize:11,color:"#475569",maxWidth:560,marginLeft:"auto",marginRight:"auto",lineHeight:1.5}}>
+                The v33 model is regime-dependent — most days produce zero ≥90% signals. Signal clusters on specific market-regime days. Try the High Conv ≥80% filter for a looser threshold, or wait for a favorable regime day.
+              </div>
+            </>
+          ) : mode==="conv80" ? (
+            <>
+              <div>No stocks at ≥80% v33 conviction at {scanHour}:00 ET.</div>
+              <div style={{marginTop:6,fontSize:11,color:"#475569",maxWidth:560,marginLeft:"auto",marginRight:"auto",lineHeight:1.5}}>
+                Regime today is unfavorable for the v33 model. The setup-based scanner (★ Setup Active) still provides firings regardless of regime.
+              </div>
+            </>
           ) : (
             `No stocks match ${mode} filter at this scan hour.`
           )}
@@ -239,7 +300,7 @@ function ScannerTab({data,scanHour,source,elapsed,message,modelWR10,modelPnL10,h
           <div style={{overflowX:"auto"}}>
             <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
               <thead><tr style={{borderBottom:"1px solid rgba(255,255,255,0.08)"}}>
-                {["#","Ticker","Conv","Sector","Price","TP $","SL $","Chg%","Win%","EV","Mom","RelVol","VWAP%","ATR","Vol","RSI","vsSPY","vsSect","Breadth","Gap"].map(h=>(
+                {["#","Ticker","Conv","CONV%","Sector","Price","TP $","SL $","Chg%","Win%","EV","Mom","RelVol","VWAP%","ATR","Vol","RSI","vsSPY","vsSect","Breadth","Gap"].map(h=>(
                   <th key={h} style={{padding:"6px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",whiteSpace:"nowrap"}}>{h}</th>))}
               </tr></thead>
               <tbody>{filtered.map((s,i)=>{const chg=parseFloat(s.changeFromOpen);const evPos=s.ev>0;return(
@@ -273,6 +334,21 @@ function ScannerTab({data,scanHour,source,elapsed,message,modelWR10,modelPnL10,h
                         conv===1?"1 setup firing":
                         `${conv} independent setups firing simultaneously (orb_vol + orb_60_break count as 1 — redundant per v16 overlap analysis). Stacking analysis shows multi-setup firings have meaningfully higher hit rates.`;
                       return <span title={title} style={{color:c,fontWeight:w}}>{conv}</span>;
+                    })()}
+                  </td>
+                  <td style={{padding:"5px 6px",fontVariantNumeric:"tabular-nums"}}>
+                    {(()=>{
+                      const p = s.convictionV33Prob;
+                      if (p == null) return <span style={{color:"#334155"}}>—</span>;
+                      const pct = Math.round(p*100);
+                      let c, w, bg;
+                      if (p >= 0.9) { c = "#10b981"; w = 700; bg = "rgba(16,185,129,0.10)"; }
+                      else if (p >= 0.8) { c = "#14b8a6"; w = 600; bg = "rgba(20,184,166,0.07)"; }
+                      else if (p >= 0.7) { c = "#a3e635"; w = 500; bg = "transparent"; }
+                      else if (p >= 0.6) { c = "#94a3b8"; w = 400; bg = "transparent"; }
+                      else { c = "#475569"; w = 400; bg = "transparent"; }
+                      const title = `v33 conviction: calibrated probability this stock reaches +${scanInfo?.v33Target||"0.32%"} by close. Regime-dependent — clusters on specific market days.`;
+                      return <span title={title} style={{color:c,fontWeight:w,padding:bg!=="transparent"?"1px 5px":0,borderRadius:2,background:bg}}>{pct}%</span>;
                     })()}
                   </td>
                   <td style={{padding:"5px 6px",color:"#64748b",fontSize:11}}>{s.sector}</td>
