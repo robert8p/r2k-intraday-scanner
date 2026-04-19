@@ -573,6 +573,21 @@ function TrainingTab() {
     return ()=>clearInterval(iv);
   },[pollV29]);
 
+  // v30: confident examples dump state
+  const [v30Prog, setV30Prog] = useState(null);
+  const [v30Results, setV30Results] = useState(null);
+  const pollV30 = useCallback(()=>{
+    fetch('/api/v30/progress').then(r=>r.json()).then(setV30Prog).catch(()=>{});
+    fetch('/api/v30/results').then(r=>r.json()).then(d=>{
+      if (d && !d.status) setV30Results(d);
+    }).catch(()=>{});
+  },[]);
+  useEffect(()=>{
+    pollV30();
+    const iv=setInterval(pollV30, 3000);
+    return ()=>clearInterval(iv);
+  },[pollV30]);
+
   const trigTrain=async()=>{
     await fetch('/api/train',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({tp_mult:tp,sl_mult:sl})});
@@ -625,6 +640,13 @@ function TrainingTab() {
     const d=await r.json();
     if(d.error) alert(`Error: ${d.error}`);
     pollV29();
+  };
+  const runV30=async()=>{
+    if(!confirm("Run v30 confident examples dump? Trains LightGBM at +0.32% target, identifies all test-fold examples where model predicted ≥0.9, dumps top 10 winners + top 10 losers with FULL detail (features, price path, setup flags) for qualitative review. Takes ~15-20 minutes.")) return;
+    const r=await fetch('/api/v30/train',{method:'POST'});
+    const d=await r.json();
+    if(d.error) alert(`Error: ${d.error}`);
+    pollV30();
   };
 
   if(ld) return <div style={{color:"#475569",padding:40,textAlign:"center"}}>Loading...</div>;
@@ -1427,6 +1449,61 @@ function TrainingTab() {
                 </table>
               </details>;
             })}
+          </div>
+        )}
+      </Box>
+
+      {/* v30: CONFIDENT EXAMPLES DUMP — trains +0.32% model, dumps 10W/10L with full detail for review */}
+      <Box>
+        <Lbl>Confident Examples Dump (v30) — export specific predictions for qualitative review</Lbl>
+        <div style={{fontSize:10,color:"#475569",marginBottom:10,lineHeight:1.5}}>
+          Trains one LightGBM model at +0.32% target (highest-passing from v29), scores the test fold, identifies all predictions with calibrated probability ≥ 0.9, and exports the top 10 confident WINNERS and top 10 confident LOSERS with full detail: every feature value, active setup flags, the full post-scan minute-by-minute price path, sector, date, scan hour. Purpose: enable human/LLM inspection of what confident predictions actually look like. No aggregates — just concrete examples.
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:10}}>
+          <Btn onClick={runV30} disabled={v30Prog?.inProgress||ip||extProg?.inProgress||repairProg?.inProgress||convProg?.inProgress||patProg?.inProgress||v28Prog?.inProgress||v29Prog?.inProgress} color="#f43f5e" style={{padding:"8px 16px",fontSize:12}}>
+            {v30Prog?.inProgress?"Running...":"Run v30 Dump"}
+          </Btn>
+          {v30Results && !v30Prog?.inProgress && (
+            <>
+              <Btn onClick={()=>downloadJson(v30Results,`v30_confident_examples_${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.json`)} color="#06b6d4" style={{padding:"8px 12px",fontSize:12}}>
+                Download JSON
+              </Btn>
+              <span style={{fontSize:11,color:"#64748b"}}>
+                Last run: {v30Results.generated_at?.slice(0,19).replace("T"," ")}
+              </span>
+            </>
+          )}
+        </div>
+        {v30Prog?.inProgress && (
+          <div style={{marginTop:10,marginBottom:10}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+              <div style={{flex:1,height:6,background:"rgba(255,255,255,0.06)",borderRadius:3,overflow:"hidden"}}>
+                <div style={{width:`${v30Prog.pct||0}%`,height:"100%",background:"#f43f5e",borderRadius:3,transition:"width 0.5s"}}/>
+              </div>
+              <span style={{fontSize:11,color:"#f43f5e",fontWeight:600}}>{v30Prog.pct||0}%</span>
+            </div>
+            <div style={{fontSize:11,color:"#64748b"}}>{v30Prog.message}</div>
+          </div>
+        )}
+        {!v30Prog?.inProgress && v30Prog?.phase === "error" && (
+          <div style={{marginTop:10,padding:"6px 10px",borderRadius:4,background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.2)"}}>
+            <div style={{fontSize:11,color:"#fca5a5",fontWeight:600}}>✗ {v30Prog.message}</div>
+          </div>
+        )}
+        {v30Results && (
+          <div style={{marginTop:14}}>
+            <div style={{padding:"8px 12px",borderRadius:4,background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.04)",marginBottom:10}}>
+              <div style={{fontSize:11,color:"#94a3b8"}}>
+                <b>Target:</b> +{v30Results.target_label}
+                {"  ·  "}<b>Total confident preds (≥0.9):</b> {v30Results.confident_summary?.total_confident_preds}
+                {"  ·  "}<b>Observed hit rate:</b> {v30Results.confident_summary?.observed_hit_rate_pct}%
+                {"  ·  "}<b>Winners pool:</b> {v30Results.confident_summary?.n_confident_winners}
+                {"  ·  "}<b>Losers pool:</b> {v30Results.confident_summary?.n_confident_losers}
+              </div>
+              <div style={{fontSize:11,color:"#64748b",marginTop:4}}>
+                Exported: top {v30Results.confident_winners?.length} winners + top {v30Results.confident_losers?.length} losers (ranked by model probability). Click Download JSON to share the full data.
+              </div>
+            </div>
           </div>
         )}
       </Box>

@@ -6014,6 +6014,255 @@ def run_v29_target_sweep():
         v29_in_progress = False
 
 
+# ═══════════════════════════════════════════════════════════════════
+# v30: CONFIDENT EXAMPLES DUMP
+# Trains ONE LightGBM model at +0.32% target (highest-passing from v29),
+# identifies test-fold examples where model predicted ≥0.9, and dumps
+# 10 winners + 10 losers with full detail (features, price path, setup flags).
+# Purpose: enable qualitative examination of confident predictions.
+# ═══════════════════════════════════════════════════════════════════
+V30_RESULTS_PATH = DATA_DIR / "v30_confident_examples.json"
+v30_in_progress = False
+v30_progress = {"phase":"idle","pct":0,"message":""}
+
+def run_v30_examples_dump(target_pct=0.0032, n_winners=10, n_losers=10):
+    """Train +0.32% model, identify prob≥0.9 test-fold examples, dump 10 winners + 10 losers with full detail."""
+    global v30_in_progress, v30_progress
+    if v30_in_progress:
+        log.warning("v30 already running"); return
+    v30_in_progress = True
+    v30_progress = {"phase":"starting","pct":0,"message":"Starting v30 examples dump..."}
+
+    try:
+        if not (BARS_DAILY_CACHE.exists() and BARS_INTRADAY_CACHE.exists()):
+            raise RuntimeError("No bar cache. Run Training first.")
+
+        import numpy as _np
+
+        v30_progress = {"phase":"loading","pct":2,"message":"Loading bars..."}
+        daily_bars = pickle.loads(BARS_DAILY_CACHE.read_bytes())
+        intraday_bars = pickle.loads(BARS_INTRADAY_CACHE.read_bytes())
+
+        iwm_daily = daily_bars.get("IWM", [])
+        if len(iwm_daily) < 200:
+            raise RuntimeError("Insufficient IWM history")
+        all_dates_list = sorted(set(b["t"][:10] for b in iwm_daily))
+        n_dates = len(all_dates_list)
+        split_tr = int(n_dates * 0.60)
+        split_va = int(n_dates * 0.80)
+        train_dates = set(all_dates_list[:split_tr])
+        val_dates = set(all_dates_list[split_tr:split_va])
+        test_dates = set(all_dates_list[split_va:])
+
+        def bars_for_date(ticker, date):
+            return [b for b in intraday_bars.get(ticker, []) if b["t"][:10] == date]
+        def daily_up_to(ticker, date):
+            return [b for b in daily_bars.get(ticker, []) if b["t"][:10] < date]
+
+        base_feat_names = FEATURE_NAMES
+        setup_feat_names = [f"setup_{s}" for s in SETUP_NAMES]
+        all_feat_names = base_feat_names + setup_feat_names + ["hour_11","hour_12","hour_13","hour_14","hour_15"]
+
+        tickers_list = [t for t in TICKERS if t not in ("SPY", "IWM")]
+
+        # Build examples — keep full metadata for test fold (ticker, date, hour, feature values, price path)
+        v30_progress = {"phase":"features","pct":5,"message":"Building features..."}
+        all_rows = []  # for all folds: vectors + labels
+        test_meta = []  # for test fold only: rich detail
+
+        for di, date in enumerate(all_dates_list):
+            if (di + 1) % 10 == 0:
+                pct = 5 + int((di / n_dates) * 65)
+                v30_progress = {"phase":"features","pct":pct,
+                    "message":f"Building features for date {di+1}/{n_dates}..."}
+            fold = "train" if date in train_dates else ("val" if date in val_dates else "test")
+
+            spy_intraday_date = [b for b in intraday_bars.get("SPY", []) if b["t"][:10] == date]
+            iwm_intraday_date = [b for b in intraday_bars.get("IWM", []) if b["t"][:10] == date]
+
+            for scan_hour in SCAN_HOURS:
+                scan_minute_et = scan_hour * 60
+                spy_before = [b for b in spy_intraday_date if (bar_to_et_minutes(b) or -1) < scan_minute_et]
+                iwm_before = [b for b in iwm_intraday_date if (bar_to_et_minutes(b) or -1) < scan_minute_et]
+                spy_ctx = compute_spy_context(spy_before) if spy_before else None
+
+                sector_green_count = defaultdict(lambda: [0, 0])
+                cache_per_tkr = {}
+                for tkr in tickers_list:
+                    tbars = bars_for_date(tkr, date)
+                    if len(tbars) < 6: continue
+                    tb = [b for b in tbars if (bar_to_et_minutes(b) or -1) < scan_minute_et]
+                    ta = [b for b in tbars if (bar_to_et_minutes(b) or -1) >= scan_minute_et]
+                    if len(tb) < 6 or len(ta) < 2: continue
+                    dl = daily_up_to(tkr, date)
+                    pc = dl[-1]["c"] if dl else None
+                    if pc is None: continue
+                    sp = tb[-1]["c"]
+                    sec = SECTORS.get(tkr, "?")
+                    sector_green_count[sec][1] += 1
+                    if sp > pc: sector_green_count[sec][0] += 1
+                    cache_per_tkr[tkr] = (tb, ta, sp, pc, dl, sec)
+
+                date_hour_rows = []
+                for ticker, (before, after, scan_price, prev_close, dl, sec) in cache_per_tkr.items():
+                    open_price = before[0]["o"]
+                    feat = compute_features(before, dl, scan_price, open_price, scan_hour,
+                                            spy_context=spy_ctx, prev_close=prev_close)
+                    if feat is None: continue
+                    sgc = sector_green_count[sec]
+                    breadth = sgc[0] / sgc[1] if sgc[1] > 0 else 0
+                    active = detect_setups(before, scan_price, prev_close,
+                                           sector_breadth=breadth, prior_daily=dl,
+                                           iwm_bars=iwm_before, scan_minute_et=scan_minute_et)
+                    setup_flags = {f"setup_{s}": int(bool(active[s])) for s in SETUP_NAMES}
+
+                    hit, _ = did_hit_target(scan_price, after[1:], target_pct=target_pct)
+
+                    date_hour_rows.append({
+                        "feat": feat, "setup_flags": setup_flags, "sector": sec, "hour": scan_hour,
+                        "label": 1 if hit else 0,
+                        "ticker": ticker, "date": date, "scan_price": scan_price,
+                        "prev_close": prev_close, "open_price": open_price,
+                        "after_bars": after, "active_setups": [s for s in SETUP_NAMES if active[s]],
+                    })
+
+                if len(date_hour_rows) < 10: continue
+                feats_list = [r["feat"] for r in date_hour_rows]
+                sectors_list = [r["sector"] for r in date_hour_rows]
+                add_ranks(feats_list)
+                add_sector_relative(feats_list, sectors_list)
+
+                for r in date_hour_rows:
+                    vec = [float(r["feat"].get(k, 0.0) or 0.0) for k in base_feat_names]
+                    vec += [float(r["setup_flags"].get(k, 0)) for k in setup_feat_names]
+                    vec += [1.0 if r["hour"] == h else 0.0 for h in [11,12,13,14,15]]
+                    all_rows.append({"vec": vec, "label": r["label"], "fold": fold})
+                    if fold == "test":
+                        test_meta.append({
+                            "ticker": r["ticker"], "date": r["date"], "hour": r["hour"],
+                            "sector": r["sector"],
+                            "scan_price": round(r["scan_price"], 4),
+                            "prev_close": round(r["prev_close"], 4),
+                            "open_price": round(r["open_price"], 4),
+                            "label": r["label"],
+                            "active_setups": r["active_setups"],
+                            "feat": {k: (round(v, 5) if isinstance(v, (int, float)) else v) for k, v in r["feat"].items()},
+                            "price_path_post_scan": _build_price_path(r["after_bars"], r["scan_price"]),
+                        })
+
+        log.info(f"v30: built {len(all_rows)} total rows, {len(test_meta)} test meta")
+        if len(all_rows) < 1000:
+            raise RuntimeError(f"Insufficient examples: {len(all_rows)}")
+
+        # Build matrices
+        v30_progress = {"phase":"vectorize","pct":72,"message":"Building matrices..."}
+        train_rows = [r for r in all_rows if r["fold"] == "train"]
+        val_rows = [r for r in all_rows if r["fold"] == "val"]
+        test_rows = [r for r in all_rows if r["fold"] == "test"]
+        X_train = _np.array([r["vec"] for r in train_rows], dtype=_np.float32)
+        X_val = _np.array([r["vec"] for r in val_rows], dtype=_np.float32)
+        X_test = _np.array([r["vec"] for r in test_rows], dtype=_np.float32)
+        y_train = _np.array([r["label"] for r in train_rows], dtype=_np.int32)
+        y_val = _np.array([r["label"] for r in val_rows], dtype=_np.int32)
+        y_test = _np.array([r["label"] for r in test_rows], dtype=_np.int32)
+
+        # Train
+        v30_progress = {"phase":"training","pct":80,"message":"Training LightGBM at target..."}
+        lgbm_params = {
+            "objective": "binary", "metric": "binary_logloss",
+            "learning_rate": 0.05, "num_leaves": 31, "min_data_in_leaf": 50,
+            "feature_fraction": 0.9, "bagging_fraction": 0.85, "bagging_freq": 5,
+            "lambda_l2": 1.0, "verbose": -1,
+        }
+        train_ds = lgb.Dataset(X_train, label=y_train, feature_name=all_feat_names)
+        val_ds = lgb.Dataset(X_val, label=y_val, feature_name=all_feat_names, reference=train_ds)
+        model = lgb.train(lgbm_params, train_ds, num_boost_round=500,
+                          valid_sets=[val_ds], valid_names=["val"],
+                          callbacks=[lgb.early_stopping(30), lgb.log_evaluation(0)])
+
+        # Calibrate
+        raw_val = model.predict(X_val, num_iteration=model.best_iteration)
+        calibrator = IsotonicRegression(out_of_bounds="clip")
+        calibrator.fit(raw_val, y_val)
+        raw_test = model.predict(X_test, num_iteration=model.best_iteration)
+        calib_test = calibrator.transform(raw_test)
+
+        # Identify confident predictions (prob ≥ 0.9)
+        v30_progress = {"phase":"selecting","pct":92,"message":"Selecting examples..."}
+        confident_mask = calib_test >= 0.9
+        n_confident = int(confident_mask.sum())
+
+        # Attach predictions to test_meta
+        for i, meta in enumerate(test_meta):
+            meta["model_prob"] = round(float(calib_test[i]), 4)
+            meta["is_confident"] = bool(calib_test[i] >= 0.9)
+
+        # Split into confident winners and confident losers
+        confident_winners = [m for m in test_meta if m["is_confident"] and m["label"] == 1]
+        confident_losers = [m for m in test_meta if m["is_confident"] and m["label"] == 0]
+
+        # Sort: winners by highest model_prob (most confident first), losers by highest model_prob (most confident first)
+        confident_winners.sort(key=lambda m: -m["model_prob"])
+        confident_losers.sort(key=lambda m: -m["model_prob"])
+
+        # Take top N of each
+        top_winners = confident_winners[:n_winners]
+        top_losers = confident_losers[:n_losers]
+
+        log.info(f"v30: {n_confident} confident predictions, {len(confident_winners)} winners, {len(confident_losers)} losers. Returning top {n_winners}W/{n_losers}L.")
+
+        results = {
+            "generated_at": datetime.now(ET).isoformat(),
+            "target_pct": target_pct,
+            "target_label": f"{target_pct*100:.2f}%",
+            "model": {
+                "n_features": len(all_feat_names),
+                "feature_names": all_feat_names,
+                "best_iteration": model.best_iteration,
+                "fold_sizes": {"train": len(X_train), "val": len(X_val), "test": len(X_test)},
+            },
+            "confident_summary": {
+                "total_confident_preds": n_confident,
+                "n_confident_winners": len(confident_winners),
+                "n_confident_losers": len(confident_losers),
+                "observed_hit_rate_pct": round((len(confident_winners) / n_confident * 100) if n_confident > 0 else 0, 2),
+            },
+            "confident_winners": top_winners,
+            "confident_losers": top_losers,
+        }
+        V30_RESULTS_PATH.write_text(json.dumps(results, indent=2, default=str))
+
+        log.info(f"v30 complete. Confident: {n_confident}, winners: {len(confident_winners)}, losers: {len(confident_losers)}")
+        v30_progress = {"phase":"done","pct":100,
+            "message":f"Done. {len(top_winners)} winners + {len(top_losers)} losers ready for download."}
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        log.error(f"v30 failed: {e}\n{tb}", exc_info=True)
+        v30_progress = {"phase":"error","pct":0,"message":str(e)}
+    finally:
+        v30_in_progress = False
+
+
+def _build_price_path(after_bars, scan_price):
+    """Summarize the post-scan price path: per-minute OHLCV trimmed to key waypoints.
+    Returns a list of {minute_et, open, high, low, close, volume, pct_from_scan} for each bar."""
+    path = []
+    for b in after_bars:
+        m = bar_to_et_minutes(b)
+        if m is None: continue
+        path.append({
+            "minute_et": m,
+            "time": f"{m//60:02d}:{m%60:02d}",
+            "open": round(b["o"], 4), "high": round(b["h"], 4),
+            "low": round(b["l"], 4), "close": round(b["c"], 4),
+            "volume": int(b["v"]),
+            "pct_from_scan_high": round((b["h"] - scan_price) / scan_price * 100, 3),
+            "pct_from_scan_close": round((b["c"] - scan_price) / scan_price * 100, 3),
+        })
+    return path
+
+
 # Evidence-quality thresholds for declaring a setup tradable at a given hour.
 # A setup is "active" only at scan hours where it survived test-fold evaluation.
 # These thresholds are deliberately conservative.
@@ -7101,6 +7350,33 @@ def v29_results_endpoint():
         return json.loads(V29_RESULTS_PATH.read_text())
     except Exception as e:
         return JSONResponse({"error":str(e)},500)
+
+# v30: confident examples dump endpoints
+@app.post("/api/v30/train")
+def trigger_v30(bg: BackgroundTasks):
+    if v30_in_progress: return {"status":"already_running"}
+    if (training_in_progress or setup_eval_in_progress or
+        conviction_train_in_progress or pattern_discovery_in_progress or
+        v28_in_progress or v29_in_progress):
+        return JSONResponse({"error":"Another task running"},400)
+    if not (BARS_DAILY_CACHE.exists() and BARS_INTRADAY_CACHE.exists()):
+        return JSONResponse({"error":"Bar cache missing"},400)
+    bg.add_task(run_v30_examples_dump)
+    return {"status":"started"}
+
+@app.get("/api/v30/progress")
+def v30_progress_endpoint():
+    return {"inProgress":v30_in_progress, **v30_progress}
+
+@app.get("/api/v30/results")
+def v30_results_endpoint():
+    if not V30_RESULTS_PATH.exists():
+        return {"status":"no_results"}
+    try:
+        return json.loads(V30_RESULTS_PATH.read_text())
+    except Exception as e:
+        return JSONResponse({"error":str(e)},500)
+
 
 
 
