@@ -528,6 +528,21 @@ function TrainingTab() {
     return ()=>clearInterval(iv);
   },[pollConv]);
 
+  // v27: pattern discovery state
+  const [patProg, setPatProg] = useState(null);
+  const [patResults, setPatResults] = useState(null);
+  const pollPat = useCallback(()=>{
+    fetch('/api/pattern/progress').then(r=>r.json()).then(setPatProg).catch(()=>{});
+    fetch('/api/pattern/results').then(r=>r.json()).then(d=>{
+      if (d && !d.status) setPatResults(d);
+    }).catch(()=>{});
+  },[]);
+  useEffect(()=>{
+    pollPat();
+    const iv=setInterval(pollPat, 3000);
+    return ()=>clearInterval(iv);
+  },[pollPat]);
+
   const trigTrain=async()=>{
     await fetch('/api/train',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({tp_mult:tp,sl_mult:sl})});
@@ -559,6 +574,13 @@ function TrainingTab() {
     const d=await r.json();
     if(d.error) alert(`Error: ${d.error}`);
     pollConv();
+  };
+  const runPatternDiscovery=async()=>{
+    if(!confirm("Run pattern discovery? Builds features for every (date × stock × scan hour), then for each (scan_hour × target +0.75%/+1%) induces a decision tree (depth 4) and validates rules on test fold (strict: n≥30, hit ≥ base+40pp, CI lower ≥ base+30pp). Takes ~20-30 minutes.")) return;
+    const r=await fetch('/api/pattern/train',{method:'POST'});
+    const d=await r.json();
+    if(d.error) alert(`Error: ${d.error}`);
+    pollPat();
   };
 
   if(ld) return <div style={{color:"#475569",padding:40,textAlign:"center"}}>Loading...</div>;
@@ -896,6 +918,151 @@ function TrainingTab() {
                   {(tres.top_features||[]).map(([name,pct])=>`${name} (${pct}%)`).join(" · ")}
                 </div>
               </details>;
+            })}
+          </div>
+        )}
+      </Box>
+
+      {/* v27: PATTERN DISCOVERY — winner profile per scan hour × target */}
+      <Box>
+        <Lbl>Pattern Discovery (v27) — winner profile per scan hour × target</Lbl>
+        <div style={{fontSize:10,color:"#475569",marginBottom:10,lineHeight:1.5}}>
+          Builds features for every date × stock × scan hour. For each scan_hour × target combination [+0.75%, +1%]: step one compares winner vs loser feature distributions via Cohen's d, step two induces a decision tree at depth 4 with min leaf 300, step three validates leaf-rules on held-out test fold. <b>Strict validation</b>: test n ≥ 30, hit rate ≥ baseline + 40pp, Wilson CI lower bound ≥ baseline + 30pp. Rules passing strict are the deployable winner profile. <i>Honest prior: v26 showed AUC 0.70-0.79 on this data; at strict +40pp threshold, very few, possibly zero, rules will validate. The distribution comparison is still informative either way.</i>
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:10}}>
+          <Btn onClick={runPatternDiscovery} disabled={patProg?.inProgress||ip||extProg?.inProgress||repairProg?.inProgress||convProg?.inProgress} color="#f59e0b" style={{padding:"8px 16px",fontSize:12}}>
+            {patProg?.inProgress?"Running...":"Run Pattern Discovery"}
+          </Btn>
+          {patResults && !patProg?.inProgress && (
+            <>
+              <Btn onClick={()=>downloadJson(patResults,`pattern_discovery_${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.json`)} color="#06b6d4" style={{padding:"8px 12px",fontSize:12}}>
+                Download JSON
+              </Btn>
+              <span style={{fontSize:11,color:"#64748b"}}>
+                Last run: {patResults.generated_at?.slice(0,19).replace("T"," ")}
+              </span>
+            </>
+          )}
+        </div>
+        {patProg?.inProgress && (
+          <div style={{marginTop:10,marginBottom:10}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+              <div style={{flex:1,height:6,background:"rgba(255,255,255,0.06)",borderRadius:3,overflow:"hidden"}}>
+                <div style={{width:`${patProg.pct||0}%`,height:"100%",background:"#f59e0b",borderRadius:3,transition:"width 0.5s"}}/>
+              </div>
+              <span style={{fontSize:11,color:"#f59e0b",fontWeight:600}}>{patProg.pct||0}%</span>
+            </div>
+            <div style={{fontSize:11,color:"#64748b"}}>{patProg.message}</div>
+          </div>
+        )}
+        {!patProg?.inProgress && patProg?.phase === "error" && (
+          <div style={{marginTop:10,padding:"6px 10px",borderRadius:4,background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.2)"}}>
+            <div style={{fontSize:11,color:"#fca5a5",fontWeight:600}}>✗ {patProg.message}</div>
+          </div>
+        )}
+        {patResults && (
+          <div style={{marginTop:14}}>
+            {/* Overall summary */}
+            <div style={{marginBottom:12,padding:"8px 12px",borderRadius:4,
+              background: patResults.total_passing_strict_rules>0?"rgba(34,197,94,0.08)":"rgba(234,179,8,0.08)",
+              border: `1px solid ${patResults.total_passing_strict_rules>0?"rgba(34,197,94,0.25)":"rgba(234,179,8,0.25)"}`}}>
+              <span style={{fontSize:11,color:"#64748b",fontWeight:600,textTransform:"uppercase",letterSpacing:0.3}}>Rules passing strict</span>
+              <span style={{marginLeft:10,color: patResults.total_passing_strict_rules>0?"#22c55e":"#eab308",fontWeight:700,letterSpacing:0.3,fontSize:14}}>
+                {patResults.total_passing_strict_rules}
+              </span>
+              <span style={{marginLeft:16,color:"#94a3b8",fontSize:11}}>
+                across {SCAN_HOURS.length} hours × 2 targets. Threshold: hit ≥ base+40pp, CI lower ≥ base+30pp, n ≥ 30.
+              </span>
+            </div>
+
+            {/* Per-hour × target detail */}
+            {SCAN_HOURS.map(h=>{
+              const hourData = patResults.per_hour_target?.[String(h)];
+              if (!hourData) return null;
+              return <div key={h} style={{marginBottom:16}}>
+                <div style={{fontSize:12,color:"#e2e8f0",fontWeight:600,marginBottom:6,paddingBottom:4,borderBottom:"1px solid rgba(255,255,255,0.1)"}}>{h}:00 ET</div>
+                {["0.75%","1.00%"].map(tlabel=>{
+                  const td = hourData[tlabel];
+                  if (!td) return <div key={tlabel} style={{fontSize:11,color:"#475569",marginLeft:8,marginBottom:8}}>+{tlabel} — no data</div>;
+                  const anyPass = td.n_passing_strict > 0;
+                  return <div key={tlabel} style={{marginLeft:0,marginBottom:12,padding:"8px 10px",borderRadius:4,background:"rgba(255,255,255,0.02)",border:`1px solid ${anyPass?"rgba(34,197,94,0.25)":"rgba(255,255,255,0.04)"}`}}>
+                    <div style={{fontSize:11,marginBottom:6,display:"flex",flexWrap:"wrap",gap:12}}>
+                      <span style={{color:"#c4b5fd",fontWeight:600}}>+{tlabel}</span>
+                      <span style={{color:"#94a3b8"}}>base (tr/va/te): <b>{td.base_rate_train}%/{td.base_rate_val ?? "—"}%/{td.base_rate_test}%</b></span>
+                      <span style={{color:"#94a3b8"}}>n test: <b>{td.n_test?.toLocaleString()}</b></span>
+                      <span style={{color:"#94a3b8"}}>required test hit ≥ <b>{td.min_test_hit_rate_required_pct}%</b>, CI lower ≥ <b>{td.min_test_ci_lower_required_pct}%</b></span>
+                      <span style={{color:anyPass?"#22c55e":"#eab308",fontWeight:700,fontSize:10,letterSpacing:0.3}}>
+                        {td.n_candidates} candidates → {td.n_validated} validated → <b>{td.n_passing_strict} pass strict</b>
+                      </span>
+                    </div>
+
+                    {/* Top 10 discriminating features */}
+                    <details style={{marginBottom:6}}>
+                      <summary style={{cursor:"pointer",fontSize:10,color:"#64748b",fontWeight:600,textTransform:"uppercase",letterSpacing:0.3}}>
+                        Top discriminating features (winner vs loser, by |Cohen's d|)
+                      </summary>
+                      <table style={{width:"100%",fontSize:10,borderCollapse:"collapse",marginTop:4}}>
+                        <thead><tr>
+                          {["Feature","Winner mean","Loser mean","Cohen's d"].map(col=>
+                            <th key={col} style={{padding:"3px 8px",textAlign:"left",color:"#64748b",fontSize:9,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase"}}>{col}</th>)}
+                        </tr></thead>
+                        <tbody>
+                          {(td.top_features||[]).slice(0,10).map((f,fi)=>{
+                            const d = f.cohens_d;
+                            const dColor = d==null?"#64748b":Math.abs(d)>=0.5?"#22c55e":Math.abs(d)>=0.3?"#a3e635":Math.abs(d)>=0.15?"#eab308":"#94a3b8";
+                            return <tr key={fi} style={{borderTop:"1px solid rgba(255,255,255,0.03)"}}>
+                              <td style={{padding:"3px 8px",color:"#e2e8f0"}}>{f.feature}</td>
+                              <td style={{padding:"3px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{f.winner_mean}</td>
+                              <td style={{padding:"3px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{f.loser_mean}</td>
+                              <td style={{padding:"3px 8px",color:dColor,fontVariantNumeric:"tabular-nums",fontWeight:600}}>{d!=null?(d>0?"+":"")+d:"—"}</td>
+                            </tr>;
+                          })}
+                        </tbody>
+                      </table>
+                    </details>
+
+                    {/* Validated rules */}
+                    {(td.validated_rules||[]).length > 0 && (
+                      <details open={anyPass}>
+                        <summary style={{cursor:"pointer",fontSize:10,color:"#64748b",fontWeight:600,textTransform:"uppercase",letterSpacing:0.3}}>
+                          Validated rules ({td.validated_rules.length}, top 30 by test hit rate)
+                        </summary>
+                        <table style={{width:"100%",fontSize:10,borderCollapse:"collapse",marginTop:4}}>
+                          <thead><tr>
+                            {["Conditions","Train n","Train hit%","Test n","Test hit%","CI 95%","Strict"].map(col=>
+                              <th key={col} style={{padding:"3px 8px",textAlign:"left",color:"#64748b",fontSize:9,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase"}}>{col}</th>)}
+                          </tr></thead>
+                          <tbody>
+                            {td.validated_rules.map((r,ri)=>{
+                              const thr = (r.test_hit_rate*100).toFixed(1);
+                              const thrColor = r.test_hit_rate>=0.7?"#22c55e":r.test_hit_rate>=0.55?"#a3e635":r.test_hit_rate>=0.45?"#eab308":"#94a3b8";
+                              const condStr = r.conditions.map(c=>`${c[0]} ${c[1]} ${typeof c[2]==="number"?c[2].toFixed(3):c[2]}`).join(" AND ");
+                              return <tr key={ri} style={{borderTop:"1px solid rgba(255,255,255,0.03)",background:r.passes_strict?"rgba(34,197,94,0.08)":"transparent"}}>
+                                <td style={{padding:"3px 8px",color:"#e2e8f0",fontSize:10,fontFamily:F}}>{condStr}</td>
+                                <td style={{padding:"3px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{r.train_n}</td>
+                                <td style={{padding:"3px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{(r.train_hit_rate*100).toFixed(1)}%</td>
+                                <td style={{padding:"3px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{r.test_n}</td>
+                                <td style={{padding:"3px 8px",color:thrColor,fontVariantNumeric:"tabular-nums",fontWeight:600}}>{thr}%</td>
+                                <td style={{padding:"3px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums",fontSize:9}}>
+                                  [{(r.test_ci_lower*100).toFixed(1)}%, {(r.test_ci_upper*100).toFixed(1)}%]
+                                </td>
+                                <td style={{padding:"3px 8px",fontSize:9,fontWeight:700,letterSpacing:0.3}}>
+                                  {r.passes_strict?<span style={{color:"#22c55e"}}>✓ STRICT</span>:<span style={{color:"#eab308"}}>✗</span>}
+                                </td>
+                              </tr>;
+                            })}
+                          </tbody>
+                        </table>
+                      </details>
+                    )}
+                    {(td.validated_rules||[]).length === 0 && (
+                      <div style={{fontSize:10,color:"#64748b",fontStyle:"italic"}}>
+                        No validated rules (decision tree found {td.n_candidates} leaf candidates on train fold matching base+40pp, but none survived test-fold validation at n≥30).
+                      </div>
+                    )}
+                  </div>;
+                })}
+              </div>;
             })}
           </div>
         )}

@@ -4974,6 +4974,347 @@ def run_conviction_training():
         conviction_train_in_progress = False
 
 
+# ═══════════════════════════════════════════════════════════════════
+# v27: PATTERN DISCOVERY — winner profile per scan hour × target
+# For each (scan_hour, target_pct):
+#   1. Build feature vectors (shared with v25/v26)
+#   2. Label each scan: hit = did stock reach +target_pct before 15:55?
+#   3. On training fold, compare winner vs loser feature distributions
+#   4. Induce a shallow decision tree, extract high-purity leaves
+#   5. Validate rules on test fold (n≥30, hit≥base+40pp, CI_lower≥base+30pp)
+#   6. Output narrative + distribution comparison + validated rules
+# ═══════════════════════════════════════════════════════════════════
+PATTERN_RESULTS_PATH = DATA_DIR / "pattern_discovery.json"
+pattern_discovery_in_progress = False
+pattern_discovery_progress = {"phase":"idle","pct":0,"message":""}
+
+def cohens_d(a, b):
+    """Standardized mean difference. a and b are numpy arrays."""
+    import numpy as _np
+    if len(a) < 2 or len(b) < 2: return None
+    na, nb = len(a), len(b)
+    sa, sb = _np.std(a, ddof=1), _np.std(b, ddof=1)
+    if na + nb - 2 <= 0: return None
+    sp2 = ((na-1)*sa*sa + (nb-1)*sb*sb) / (na + nb - 2)
+    if sp2 <= 0: return None
+    return float((_np.mean(a) - _np.mean(b)) / (sp2 ** 0.5))
+
+def run_pattern_discovery():
+    """v27: Discover winner profile for +0.75% AND +1% targets, per scan hour, strict validation."""
+    global pattern_discovery_in_progress, pattern_discovery_progress
+    if pattern_discovery_in_progress:
+        log.warning("pattern discovery already running")
+        return
+    pattern_discovery_in_progress = True
+    pattern_discovery_progress = {"phase":"starting","pct":0,"message":"Starting pattern discovery..."}
+
+    try:
+        if not (BARS_DAILY_CACHE.exists() and BARS_INTRADAY_CACHE.exists()):
+            raise RuntimeError("No bar cache. Run Training first.")
+
+        pattern_discovery_progress = {"phase":"loading","pct":2,"message":"Loading bars..."}
+        daily_bars = pickle.loads(BARS_DAILY_CACHE.read_bytes())
+        intraday_bars = pickle.loads(BARS_INTRADAY_CACHE.read_bytes())
+
+        iwm_daily = daily_bars.get("IWM", [])
+        if len(iwm_daily) < 200:
+            raise RuntimeError(f"Insufficient IWM daily history")
+        all_dates_list = sorted(set(b["t"][:10] for b in iwm_daily))
+        n_dates = len(all_dates_list)
+        split_tr = int(n_dates * 0.60)
+        split_va = int(n_dates * 0.80)
+        train_dates = set(all_dates_list[:split_tr])
+        val_dates = set(all_dates_list[split_tr:split_va])
+        test_dates = set(all_dates_list[split_va:])
+        log.info(f"Pattern discovery: {len(train_dates)}/{len(val_dates)}/{len(test_dates)} train/val/test dates")
+
+        def bars_for_date(ticker, date):
+            return [b for b in intraday_bars.get(ticker, []) if b["t"][:10] == date]
+        def daily_up_to(ticker, date):
+            return [b for b in daily_bars.get(ticker, []) if b["t"][:10] < date]
+
+        # Feature schema — shared with v25/v26
+        base_feat_names = FEATURE_NAMES
+        setup_feat_names = [f"setup_{s}" for s in SETUP_NAMES]
+        all_feat_names = base_feat_names + setup_feat_names  # no hour one-hots since we analyze per hour
+
+        tickers = [t for t in TICKERS if t not in ("SPY", "IWM")]
+        scan_hours = SCAN_HOURS  # [11,12,13,14,15]
+
+        # Build examples PER SCAN HOUR — dict of hour → {train: [(feat_vec, labels)], val: ..., test: ...}
+        # labels is a dict with both target outcomes
+        examples_per_hour = {h: {"train": [], "val": [], "test": []} for h in scan_hours}
+
+        for di, date in enumerate(all_dates_list):
+            if (di + 1) % 10 == 0:
+                pct = 5 + int((di / n_dates) * 55)
+                pattern_discovery_progress = {"phase":"features","pct":pct,
+                    "message":f"Building features for date {di+1}/{n_dates}..."}
+            fold = "train" if date in train_dates else ("val" if date in val_dates else "test")
+
+            spy_intraday_date = [b for b in intraday_bars.get("SPY", []) if b["t"][:10] == date]
+            iwm_intraday_date = [b for b in intraday_bars.get("IWM", []) if b["t"][:10] == date]
+
+            for scan_hour in scan_hours:
+                scan_minute_et = scan_hour * 60
+                spy_before = [b for b in spy_intraday_date if (bar_to_et_minutes(b) or -1) < scan_minute_et]
+                iwm_before = [b for b in iwm_intraday_date if (bar_to_et_minutes(b) or -1) < scan_minute_et]
+                spy_ctx = compute_spy_context(spy_before) if spy_before else None
+
+                # Compute sector breadth
+                sector_green_count = defaultdict(lambda: [0, 0])
+                cache_per_tkr = {}
+                for tkr in tickers:
+                    tbars = bars_for_date(tkr, date)
+                    if len(tbars) < 6: continue
+                    tb = [b for b in tbars if (bar_to_et_minutes(b) or -1) < scan_minute_et]
+                    ta = [b for b in tbars if (bar_to_et_minutes(b) or -1) >= scan_minute_et]
+                    if len(tb) < 6 or len(ta) < 2: continue
+                    dl = daily_up_to(tkr, date)
+                    pc = dl[-1]["c"] if dl else None
+                    if pc is None: continue
+                    sp = tb[-1]["c"]
+                    sec = SECTORS.get(tkr, "?")
+                    sector_green_count[sec][1] += 1
+                    if sp > pc: sector_green_count[sec][0] += 1
+                    cache_per_tkr[tkr] = (tb, ta, sp, pc, dl, sec)
+
+                date_hour_rows = []
+                for ticker, (before, after, scan_price, prev_close, dl, sec) in cache_per_tkr.items():
+                    open_price = before[0]["o"]
+                    feat = compute_features(before, dl, scan_price, open_price, scan_hour,
+                                            spy_context=spy_ctx, prev_close=prev_close)
+                    if feat is None: continue
+                    sgc = sector_green_count[sec]
+                    breadth = sgc[0] / sgc[1] if sgc[1] > 0 else 0
+                    active = detect_setups(before, scan_price, prev_close,
+                                           sector_breadth=breadth,
+                                           prior_daily=dl, iwm_bars=iwm_before,
+                                           scan_minute_et=scan_minute_et)
+                    setup_flags = {f"setup_{s}": int(bool(active[s])) for s in SETUP_NAMES}
+
+                    # Both target labels
+                    hit_75, _ = did_hit_target(scan_price, after[1:], target_pct=0.0075)
+                    hit_100, _ = did_hit_target(scan_price, after[1:], target_pct=0.01)
+
+                    date_hour_rows.append({
+                        "feat": feat, "setup_flags": setup_flags, "sector": sec,
+                        "label_075": 1 if hit_75 else 0, "label_100": 1 if hit_100 else 0,
+                    })
+
+                if len(date_hour_rows) < 10: continue
+                feats_list = [r["feat"] for r in date_hour_rows]
+                sectors_list = [r["sector"] for r in date_hour_rows]
+                add_ranks(feats_list)
+                add_sector_relative(feats_list, sectors_list)
+
+                for r in date_hour_rows:
+                    vec = [float(r["feat"].get(k, 0.0) or 0.0) for k in base_feat_names]
+                    vec += [float(r["setup_flags"].get(k, 0)) for k in setup_feat_names]
+                    examples_per_hour[scan_hour][fold].append({
+                        "vec": vec, "label_075": r["label_075"], "label_100": r["label_100"],
+                    })
+
+        log.info(f"Examples per hour: " + ", ".join(
+            f"{h}={len(examples_per_hour[h]['train'])+len(examples_per_hour[h]['val'])+len(examples_per_hour[h]['test'])}"
+            for h in scan_hours))
+
+        # Now run discovery + validation per (hour, target)
+        import numpy as _np
+        try:
+            from sklearn.tree import DecisionTreeClassifier, _tree
+        except Exception as e:
+            raise RuntimeError(f"sklearn.tree not available: {e}")
+
+        pattern_discovery_progress = {"phase":"discovery","pct":65,"message":"Discovering patterns..."}
+
+        def extract_rules_from_tree(tree, feat_names, min_leaf_n, min_hit_rate):
+            """Walk a decision tree; for each leaf with n≥min_leaf_n and hit_rate≥min_hit_rate,
+            return the list of conditions from root to leaf."""
+            t = tree.tree_
+            FEAT_UNDEFINED = _tree.TREE_UNDEFINED
+            rules = []
+            def walk(node_id, conditions):
+                if t.feature[node_id] != FEAT_UNDEFINED:
+                    fname = feat_names[t.feature[node_id]]
+                    thresh = float(t.threshold[node_id])
+                    walk(t.children_left[node_id], conditions + [(fname, "<=", thresh)])
+                    walk(t.children_right[node_id], conditions + [(fname, ">", thresh)])
+                else:
+                    # Leaf
+                    # values shape: (1, n_classes) for sklearn tree classifier
+                    vals = t.value[node_id][0]
+                    n_total = int(vals.sum())
+                    n_pos = int(vals[1]) if len(vals) > 1 else 0
+                    if n_total >= min_leaf_n:
+                        hr = n_pos / n_total
+                        if hr >= min_hit_rate:
+                            rules.append({
+                                "conditions": conditions,
+                                "train_n": n_total, "train_hits": n_pos,
+                                "train_hit_rate": hr,
+                            })
+            walk(0, [])
+            return rules
+
+        def evaluate_rule_on_set(rule, vecs, labels, feat_idx):
+            """Apply rule conditions to vectors; return (n_match, n_hits)."""
+            mask = _np.ones(len(vecs), dtype=bool)
+            for (fname, op, thresh) in rule["conditions"]:
+                col = vecs[:, feat_idx[fname]]
+                if op == "<=":
+                    mask &= (col <= thresh)
+                else:
+                    mask &= (col > thresh)
+            n_match = int(mask.sum())
+            n_hits = int(labels[mask].sum()) if n_match > 0 else 0
+            return n_match, n_hits
+
+        feat_idx = {n: i for i, n in enumerate(all_feat_names)}
+        targets = [("0.75%", "label_075", 0.0075), ("1.00%", "label_100", 0.01)]
+        per_hour_target_results = {}
+
+        for hi, h in enumerate(scan_hours):
+            hour_ex = examples_per_hour[h]
+            if not hour_ex["train"] or not hour_ex["test"]:
+                continue
+            X_train = _np.array([e["vec"] for e in hour_ex["train"]], dtype=_np.float32)
+            X_val = _np.array([e["vec"] for e in hour_ex["val"]], dtype=_np.float32) if hour_ex["val"] else _np.zeros((0, X_train.shape[1]))
+            X_test = _np.array([e["vec"] for e in hour_ex["test"]], dtype=_np.float32)
+
+            per_hour_target_results[h] = {}
+
+            for ti, (tlabel, label_key, target_pct) in enumerate(targets):
+                progress_pct = 70 + int(((hi * len(targets) + ti) / (len(scan_hours) * len(targets))) * 25)
+                pattern_discovery_progress = {"phase":"discovery","pct":progress_pct,
+                    "message":f"Analyzing {h}:00 × {tlabel}..."}
+
+                y_train = _np.array([e[label_key] for e in hour_ex["train"]], dtype=_np.int32)
+                y_val = _np.array([e[label_key] for e in hour_ex["val"]], dtype=_np.int32) if hour_ex["val"] else _np.array([], dtype=_np.int32)
+                y_test = _np.array([e[label_key] for e in hour_ex["test"]], dtype=_np.int32)
+
+                train_base = float(y_train.mean())
+                val_base = float(y_val.mean()) if len(y_val) > 0 else None
+                test_base = float(y_test.mean())
+                log.info(f"{h}:00 × {tlabel}: n_train={len(y_train)}, base_train={train_base:.3f}, base_test={test_base:.3f}")
+
+                # Winner vs loser distribution comparison (on train fold)
+                win_mask = (y_train == 1)
+                los_mask = (y_train == 0)
+                distribution = []
+                for fn in all_feat_names:
+                    col = X_train[:, feat_idx[fn]]
+                    win_vals = col[win_mask]
+                    los_vals = col[los_mask]
+                    if len(win_vals) == 0 or len(los_vals) == 0:
+                        continue
+                    w_mean = float(_np.mean(win_vals))
+                    l_mean = float(_np.mean(los_vals))
+                    d = cohens_d(win_vals, los_vals)
+                    distribution.append({
+                        "feature": fn,
+                        "winner_mean": round(w_mean, 4),
+                        "loser_mean": round(l_mean, 4),
+                        "cohens_d": round(d, 3) if d is not None else None,
+                    })
+                # Sort by |d| desc
+                distribution.sort(key=lambda x: -abs(x["cohens_d"] or 0))
+
+                # Strict validation thresholds (PER YOUR SPEC):
+                # test fold n≥30, hit rate ≥ baseline + 40pp, CI_lower ≥ baseline + 30pp
+                min_test_hr = test_base + 0.40
+                min_test_ci_lower = test_base + 0.30
+
+                # Discovery: decision tree
+                # Depth capped at 4 → rules of ≤4 conditions (your "strict").
+                # min_samples_leaf = 300 on train to avoid rules too small to validate.
+                clf = DecisionTreeClassifier(
+                    max_depth=4, min_samples_leaf=300, criterion="gini", random_state=42,
+                )
+                clf.fit(X_train, y_train)
+
+                # Extract candidate rules from leaves with train hit_rate ≥ baseline + 40pp
+                # (matching the eventual test threshold)
+                min_leaf_n_train = 300
+                min_train_hit_rate = train_base + 0.40
+                candidates = extract_rules_from_tree(
+                    clf, all_feat_names, min_leaf_n_train, min_train_hit_rate
+                )
+
+                # Validate each candidate on test fold
+                validated = []
+                for cand in candidates:
+                    n_match, n_hits = evaluate_rule_on_set(cand, X_test, y_test, feat_idx)
+                    if n_match < 30: continue
+                    test_hr = n_hits / n_match
+                    lower, upper = wilson_ci(n_hits, n_match)
+                    passes = test_hr >= min_test_hr and lower >= min_test_ci_lower
+                    record = {
+                        "conditions": cand["conditions"],
+                        "train_n": cand["train_n"],
+                        "train_hit_rate": round(cand["train_hit_rate"], 4),
+                        "test_n": n_match,
+                        "test_hits": n_hits,
+                        "test_hit_rate": round(test_hr, 4),
+                        "test_ci_lower": round(lower, 4),
+                        "test_ci_upper": round(upper, 4),
+                        "passes_strict": passes,
+                    }
+                    validated.append(record)
+
+                validated.sort(key=lambda r: -r["test_hit_rate"])
+
+                per_hour_target_results[h][tlabel] = {
+                    "hour": h,
+                    "target": tlabel,
+                    "n_train": len(y_train),
+                    "n_val": len(y_val),
+                    "n_test": len(y_test),
+                    "base_rate_train": round(train_base * 100, 2),
+                    "base_rate_val": round(val_base * 100, 2) if val_base is not None else None,
+                    "base_rate_test": round(test_base * 100, 2),
+                    "min_test_hit_rate_required_pct": round(min_test_hr * 100, 2),
+                    "min_test_ci_lower_required_pct": round(min_test_ci_lower * 100, 2),
+                    "n_candidates": len(candidates),
+                    "n_validated": len(validated),
+                    "n_passing_strict": sum(1 for r in validated if r["passes_strict"]),
+                    "top_features": distribution[:20],
+                    "validated_rules": validated[:30],  # top 30 by test hit rate
+                }
+
+        # Overall verdict
+        passing_count = sum(
+            per_hour_target_results.get(h, {}).get(tlabel, {}).get("n_passing_strict", 0)
+            for h in scan_hours for _, tlabel, _ in [(None, "0.75%", None), (None, "1.00%", None)]
+        )
+
+        results = {
+            "generated_at": datetime.now(ET).isoformat(),
+            "config": {
+                "targets": ["0.75%", "1.00%"],
+                "scan_hours": scan_hours,
+                "tree_max_depth": 4,
+                "min_samples_leaf_train": 300,
+                "strict_test_threshold_pp_above_base": 40,
+                "strict_test_ci_lower_pp_above_base": 30,
+            },
+            "total_passing_strict_rules": passing_count,
+            "per_hour_target": {str(h): per_hour_target_results.get(h, {}) for h in scan_hours},
+        }
+        PATTERN_RESULTS_PATH.write_text(json.dumps(results, indent=2, default=str))
+
+        log.info(f"Pattern discovery complete. {passing_count} rules pass strict validation.")
+        pattern_discovery_progress = {"phase":"done","pct":100,
+            "message":f"Done. {passing_count} rules pass strict threshold."}
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        log.error(f"Pattern discovery failed: {e}\n{tb}", exc_info=True)
+        pattern_discovery_progress = {"phase":"error","pct":0,"message":str(e)}
+    finally:
+        pattern_discovery_in_progress = False
+
+
 # Evidence-quality thresholds for declaring a setup tradable at a given hour.
 # A setup is "active" only at scan hours where it survived test-fold evaluation.
 # These thresholds are deliberately conservative.
@@ -5987,6 +6328,31 @@ def conviction_results_endpoint():
         return json.loads(CONVICTION_RESULTS_PATH.read_text())
     except Exception as e:
         return JSONResponse({"error":str(e)},500)
+
+# v27: pattern discovery endpoints
+@app.post("/api/pattern/train")
+def trigger_pattern_discovery(bg: BackgroundTasks):
+    if pattern_discovery_in_progress: return {"status":"already_running"}
+    if training_in_progress or setup_eval_in_progress or conviction_train_in_progress:
+        return JSONResponse({"error":"Another task running"},400)
+    if not (BARS_DAILY_CACHE.exists() and BARS_INTRADAY_CACHE.exists()):
+        return JSONResponse({"error":"Bar cache missing"},400)
+    bg.add_task(run_pattern_discovery)
+    return {"status":"started"}
+
+@app.get("/api/pattern/progress")
+def pattern_progress_endpoint():
+    return {"inProgress":pattern_discovery_in_progress, **pattern_discovery_progress}
+
+@app.get("/api/pattern/results")
+def pattern_results_endpoint():
+    if not PATTERN_RESULTS_PATH.exists():
+        return {"status":"no_results"}
+    try:
+        return json.loads(PATTERN_RESULTS_PATH.read_text())
+    except Exception as e:
+        return JSONResponse({"error":str(e)},500)
+
 
 
 @app.post("/api/setup/reset")
