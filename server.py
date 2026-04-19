@@ -5744,6 +5744,276 @@ def run_v28_cost_adjusted():
         v28_in_progress = False
 
 
+# ═══════════════════════════════════════════════════════════════════
+# v29: FINE-GRAINED TARGET SWEEP
+# Tests every 1bps target from 0.31% to 0.40% using the same LightGBM
+# classifier framework as v28. Goal: find the highest target that still
+# passes the strict 80% bar (n≥30 in 0.8+ bucket with Wilson CI_lower ≥75%).
+#
+# v28 results: +0.30% passed (0.9+ bucket 86.96%, CI_lower 80.32%),
+# +0.40% failed (0.8-0.9 bucket CI_lower 69.58%), so the failure
+# point is between these values. This sweep pinpoints it.
+# ═══════════════════════════════════════════════════════════════════
+V29_RESULTS_PATH = DATA_DIR / "v29_target_sweep_results.json"
+v29_in_progress = False
+v29_progress = {"phase":"idle","pct":0,"message":""}
+
+def run_v29_target_sweep():
+    """Sweep 0.31% through 0.40% at 1bps increments, LightGBM classifier each."""
+    global v29_in_progress, v29_progress
+    if v29_in_progress:
+        log.warning("v29 already running"); return
+    v29_in_progress = True
+    v29_progress = {"phase":"starting","pct":0,"message":"Starting v29 fine-grained target sweep..."}
+
+    try:
+        if not (BARS_DAILY_CACHE.exists() and BARS_INTRADAY_CACHE.exists()):
+            raise RuntimeError("No bar cache. Run Training first.")
+
+        import numpy as _np
+        from sklearn.metrics import roc_auc_score as _auc
+
+        v29_progress = {"phase":"loading","pct":2,"message":"Loading bars..."}
+        daily_bars = pickle.loads(BARS_DAILY_CACHE.read_bytes())
+        intraday_bars = pickle.loads(BARS_INTRADAY_CACHE.read_bytes())
+
+        iwm_daily = daily_bars.get("IWM", [])
+        if len(iwm_daily) < 200:
+            raise RuntimeError("Insufficient IWM history")
+        all_dates_list = sorted(set(b["t"][:10] for b in iwm_daily))
+        n_dates = len(all_dates_list)
+        split_tr = int(n_dates * 0.60)
+        split_va = int(n_dates * 0.80)
+        train_dates = set(all_dates_list[:split_tr])
+        val_dates = set(all_dates_list[split_tr:split_va])
+        test_dates = set(all_dates_list[split_va:])
+
+        def bars_for_date(ticker, date):
+            return [b for b in intraday_bars.get(ticker, []) if b["t"][:10] == date]
+        def daily_up_to(ticker, date):
+            return [b for b in daily_bars.get(ticker, []) if b["t"][:10] < date]
+
+        base_feat_names = FEATURE_NAMES
+        setup_feat_names = [f"setup_{s}" for s in SETUP_NAMES]
+        all_feat_names_lgbm = base_feat_names + setup_feat_names + ["hour_11","hour_12","hour_13","hour_14","hour_15"]
+
+        tickers_list = [t for t in TICKERS if t not in ("SPY", "IWM")]
+        scan_hours = SCAN_HOURS
+        # 10 targets: 0.31%, 0.32%, ..., 0.40%
+        TARGET_PCTS = [round(0.0030 + i * 0.0001, 4) for i in range(1, 11)]
+        TARGET_LABELS = [f"{tp*100:.2f}%" for tp in TARGET_PCTS]
+        log.info(f"v29 sweep targets: {TARGET_LABELS}")
+
+        v29_progress = {"phase":"features","pct":5,"message":"Building features (shared across all 10 targets)..."}
+        all_examples = []  # list of {vec, labels_dict, fold}
+
+        for di, date in enumerate(all_dates_list):
+            if (di + 1) % 10 == 0:
+                pct = 5 + int((di / n_dates) * 55)
+                v29_progress = {"phase":"features","pct":pct,
+                    "message":f"Building features for date {di+1}/{n_dates}..."}
+            fold = "train" if date in train_dates else ("val" if date in val_dates else "test")
+
+            spy_intraday_date = [b for b in intraday_bars.get("SPY", []) if b["t"][:10] == date]
+            iwm_intraday_date = [b for b in intraday_bars.get("IWM", []) if b["t"][:10] == date]
+
+            for scan_hour in scan_hours:
+                scan_minute_et = scan_hour * 60
+                spy_before = [b for b in spy_intraday_date if (bar_to_et_minutes(b) or -1) < scan_minute_et]
+                iwm_before = [b for b in iwm_intraday_date if (bar_to_et_minutes(b) or -1) < scan_minute_et]
+                spy_ctx = compute_spy_context(spy_before) if spy_before else None
+
+                sector_green_count = defaultdict(lambda: [0, 0])
+                cache_per_tkr = {}
+                for tkr in tickers_list:
+                    tbars = bars_for_date(tkr, date)
+                    if len(tbars) < 6: continue
+                    tb = [b for b in tbars if (bar_to_et_minutes(b) or -1) < scan_minute_et]
+                    ta = [b for b in tbars if (bar_to_et_minutes(b) or -1) >= scan_minute_et]
+                    if len(tb) < 6 or len(ta) < 2: continue
+                    dl = daily_up_to(tkr, date)
+                    pc = dl[-1]["c"] if dl else None
+                    if pc is None: continue
+                    sp = tb[-1]["c"]
+                    sec = SECTORS.get(tkr, "?")
+                    sector_green_count[sec][1] += 1
+                    if sp > pc: sector_green_count[sec][0] += 1
+                    cache_per_tkr[tkr] = (tb, ta, sp, pc, dl, sec)
+
+                date_hour_rows = []
+                for ticker, (before, after, scan_price, prev_close, dl, sec) in cache_per_tkr.items():
+                    open_price = before[0]["o"]
+                    feat = compute_features(before, dl, scan_price, open_price, scan_hour,
+                                            spy_context=spy_ctx, prev_close=prev_close)
+                    if feat is None: continue
+                    sgc = sector_green_count[sec]
+                    breadth = sgc[0] / sgc[1] if sgc[1] > 0 else 0
+                    active = detect_setups(before, scan_price, prev_close,
+                                           sector_breadth=breadth, prior_daily=dl,
+                                           iwm_bars=iwm_before, scan_minute_et=scan_minute_et)
+                    setup_flags = {f"setup_{s}": int(bool(active[s])) for s in SETUP_NAMES}
+
+                    # Compute 10 target labels (by-close)
+                    labels = {}
+                    for tp in TARGET_PCTS:
+                        hit, _ = did_hit_target(scan_price, after[1:], target_pct=tp)
+                        labels[f"t{int(round(tp*10000))}"] = 1 if hit else 0
+
+                    date_hour_rows.append({
+                        "feat": feat, "setup_flags": setup_flags, "sector": sec,
+                        "labels": labels, "hour": scan_hour,
+                    })
+
+                if len(date_hour_rows) < 10: continue
+                feats_list = [r["feat"] for r in date_hour_rows]
+                sectors_list = [r["sector"] for r in date_hour_rows]
+                add_ranks(feats_list)
+                add_sector_relative(feats_list, sectors_list)
+
+                for r in date_hour_rows:
+                    vec = [float(r["feat"].get(k, 0.0) or 0.0) for k in base_feat_names]
+                    vec += [float(r["setup_flags"].get(k, 0)) for k in setup_feat_names]
+                    vec += [1.0 if r["hour"] == h else 0.0 for h in [11,12,13,14,15]]
+                    all_examples.append({"vec": vec, "labels": r["labels"], "fold": fold})
+
+        total_ex = len(all_examples)
+        log.info(f"v29: built {total_ex} examples")
+        if total_ex < 1000:
+            raise RuntimeError(f"Insufficient examples: {total_ex}")
+
+        # Build shared matrices
+        v29_progress = {"phase":"vectorize","pct":62,"message":"Building matrices..."}
+        X_all = _np.array([e["vec"] for e in all_examples], dtype=_np.float32)
+        fold_arr = _np.array([0 if e["fold"]=="train" else (1 if e["fold"]=="val" else 2) for e in all_examples])
+        train_idx = _np.where(fold_arr == 0)[0]
+        val_idx = _np.where(fold_arr == 1)[0]
+        test_idx = _np.where(fold_arr == 2)[0]
+        X_train = X_all[train_idx]
+        X_val = X_all[val_idx]
+        X_test = X_all[test_idx]
+        log.info(f"v29 shapes: train={X_train.shape}, val={X_val.shape}, test={X_test.shape}")
+
+        lgbm_params = {
+            "objective": "binary", "metric": "binary_logloss",
+            "learning_rate": 0.05, "num_leaves": 31, "min_data_in_leaf": 50,
+            "feature_fraction": 0.9, "bagging_fraction": 0.85, "bagging_freq": 5,
+            "lambda_l2": 1.0, "verbose": -1,
+        }
+        buckets_def = [
+            (0.0, 0.3, "0.0-0.3"), (0.3, 0.4, "0.3-0.4"), (0.4, 0.5, "0.4-0.5"),
+            (0.5, 0.6, "0.5-0.6"), (0.6, 0.7, "0.6-0.7"), (0.7, 0.8, "0.7-0.8"),
+            (0.8, 0.9, "0.8-0.9"), (0.9, 1.01, "0.9+"),
+        ]
+
+        per_target = {}
+        for ti, (tp, tlabel) in enumerate(zip(TARGET_PCTS, TARGET_LABELS)):
+            tkey = f"t{int(round(tp*10000))}"
+            pct_done = 65 + int((ti / len(TARGET_PCTS)) * 32)
+            v29_progress = {"phase":"training","pct":pct_done,
+                "message":f"Training target {ti+1}/{len(TARGET_PCTS)}: +{tlabel}"}
+
+            y_train = _np.array([all_examples[i]["labels"][tkey] for i in train_idx], dtype=_np.int32)
+            y_val = _np.array([all_examples[i]["labels"][tkey] for i in val_idx], dtype=_np.int32)
+            y_test = _np.array([all_examples[i]["labels"][tkey] for i in test_idx], dtype=_np.int32)
+
+            train_ds = lgb.Dataset(X_train, label=y_train, feature_name=all_feat_names_lgbm)
+            val_ds = lgb.Dataset(X_val, label=y_val, feature_name=all_feat_names_lgbm, reference=train_ds)
+            try:
+                model = lgb.train(
+                    lgbm_params, train_ds, num_boost_round=500,
+                    valid_sets=[val_ds], valid_names=["val"],
+                    callbacks=[lgb.early_stopping(30), lgb.log_evaluation(0)],
+                )
+            except Exception as e:
+                log.error(f"v29 target {tlabel} failed: {e}")
+                per_target[tlabel] = {"error": str(e)}
+                continue
+
+            raw_val = model.predict(X_val, num_iteration=model.best_iteration)
+            calibrator = IsotonicRegression(out_of_bounds="clip")
+            calibrator.fit(raw_val, y_val)
+            raw_test = model.predict(X_test, num_iteration=model.best_iteration)
+            calib_test = calibrator.transform(raw_test)
+            try:
+                auc_test = round(_auc(y_test, raw_test), 4)
+            except Exception:
+                auc_test = None
+
+            bucket_stats = []
+            for lo, hi, lbl in buckets_def:
+                mask = (calib_test >= lo) & (calib_test < hi)
+                n = int(mask.sum())
+                if n == 0:
+                    bucket_stats.append({"bucket": lbl, "n": 0, "n_hits": 0,
+                        "hit_rate_pct": None, "ci_lower_pct": None, "ci_upper_pct": None,
+                        "mean_predicted_prob": None})
+                    continue
+                hits = int(y_test[mask].sum())
+                lower, upper = wilson_ci(hits, n)
+                bucket_stats.append({
+                    "bucket": lbl, "n": n, "n_hits": hits,
+                    "hit_rate_pct": round(hits / n * 100, 2),
+                    "ci_lower_pct": round(lower * 100, 2),
+                    "ci_upper_pct": round(upper * 100, 2),
+                    "mean_predicted_prob": round(float(calib_test[mask].mean()), 3),
+                })
+
+            pass_buckets = [b for b in bucket_stats
+                            if b["bucket"] in ("0.8-0.9", "0.9+")
+                            and b["n"] and b["n"] >= 30
+                            and b["ci_lower_pct"] is not None and b["ci_lower_pct"] >= 75]
+            verdict = "ACHIEVES_80_HIGH_CONFIDENCE" if pass_buckets else "DOES_NOT_ACHIEVE_80"
+
+            per_target[tlabel] = {
+                "target_pct": tlabel,
+                "base_rates": {
+                    "train": round(float(y_train.mean()) * 100, 2),
+                    "val": round(float(y_val.mean()) * 100, 2),
+                    "test": round(float(y_test.mean()) * 100, 2),
+                },
+                "auc_test": auc_test,
+                "buckets": bucket_stats,
+                "verdict": verdict,
+                "best_iteration": model.best_iteration,
+                "passing_buckets": [b["bucket"] for b in pass_buckets],
+            }
+            log.info(f"v29 {tlabel}: AUC={auc_test}, verdict={verdict}, passing={[b['bucket'] for b in pass_buckets]}")
+
+        # Summary: find highest passing target
+        passing_labels = [tl for tl in TARGET_LABELS
+                          if per_target.get(tl, {}).get("verdict") == "ACHIEVES_80_HIGH_CONFIDENCE"]
+        highest_passing = passing_labels[-1] if passing_labels else None
+
+        results = {
+            "generated_at": datetime.now(ET).isoformat(),
+            "config": {
+                "targets_tested": TARGET_LABELS,
+                "target_pcts": TARGET_PCTS,
+                "bucket_pass_n_min": 30,
+                "bucket_pass_ci_lower_min_pct": 75,
+                "note": "Sweep between v28's passing +0.30% and failing +0.40% to find breakpoint",
+            },
+            "fold_sizes": {"train": int(len(train_idx)), "val": int(len(val_idx)), "test": int(len(test_idx))},
+            "n_features": len(all_feat_names_lgbm),
+            "n_passing_targets": len(passing_labels),
+            "passing_targets": passing_labels,
+            "highest_passing_target": highest_passing,
+            "per_target": per_target,
+        }
+        V29_RESULTS_PATH.write_text(json.dumps(results, indent=2, default=str))
+
+        log.info(f"v29 complete. Passing targets: {passing_labels}, highest: {highest_passing}")
+        v29_progress = {"phase":"done","pct":100,
+            "message":f"Done. {len(passing_labels)}/10 targets pass. Highest: {highest_passing or 'none'}"}
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        log.error(f"v29 failed: {e}\n{tb}", exc_info=True)
+        v29_progress = {"phase":"error","pct":0,"message":str(e)}
+    finally:
+        v29_in_progress = False
+
+
 # Evidence-quality thresholds for declaring a setup tradable at a given hour.
 # A setup is "active" only at scan hours where it survived test-fold evaluation.
 # These thresholds are deliberately conservative.
@@ -6806,6 +7076,32 @@ def v28_results_endpoint():
         return json.loads(V28_RESULTS_PATH.read_text())
     except Exception as e:
         return JSONResponse({"error":str(e)},500)
+
+# v29: fine-grained target sweep endpoints
+@app.post("/api/v29/train")
+def trigger_v29(bg: BackgroundTasks):
+    if v29_in_progress: return {"status":"already_running"}
+    if (training_in_progress or setup_eval_in_progress or
+        conviction_train_in_progress or pattern_discovery_in_progress or v28_in_progress):
+        return JSONResponse({"error":"Another task running"},400)
+    if not (BARS_DAILY_CACHE.exists() and BARS_INTRADAY_CACHE.exists()):
+        return JSONResponse({"error":"Bar cache missing"},400)
+    bg.add_task(run_v29_target_sweep)
+    return {"status":"started"}
+
+@app.get("/api/v29/progress")
+def v29_progress_endpoint():
+    return {"inProgress":v29_in_progress, **v29_progress}
+
+@app.get("/api/v29/results")
+def v29_results_endpoint():
+    if not V29_RESULTS_PATH.exists():
+        return {"status":"no_results"}
+    try:
+        return json.loads(V29_RESULTS_PATH.read_text())
+    except Exception as e:
+        return JSONResponse({"error":str(e)},500)
+
 
 
 

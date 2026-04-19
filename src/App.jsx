@@ -558,6 +558,21 @@ function TrainingTab() {
     return ()=>clearInterval(iv);
   },[pollV28]);
 
+  // v29: fine-grained target sweep state
+  const [v29Prog, setV29Prog] = useState(null);
+  const [v29Results, setV29Results] = useState(null);
+  const pollV29 = useCallback(()=>{
+    fetch('/api/v29/progress').then(r=>r.json()).then(setV29Prog).catch(()=>{});
+    fetch('/api/v29/results').then(r=>r.json()).then(d=>{
+      if (d && !d.status) setV29Results(d);
+    }).catch(()=>{});
+  },[]);
+  useEffect(()=>{
+    pollV29();
+    const iv=setInterval(pollV29, 3000);
+    return ()=>clearInterval(iv);
+  },[pollV29]);
+
   const trigTrain=async()=>{
     await fetch('/api/train',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({tp_mult:tp,sl_mult:sl})});
@@ -603,6 +618,13 @@ function TrainingTab() {
     const d=await r.json();
     if(d.error) alert(`Error: ${d.error}`);
     pollV28();
+  };
+  const runV29=async()=>{
+    if(!confirm("Run v29 fine-grained target sweep? Tests every 1bps target from +0.31% to +0.40% using LightGBM classifier. Pinpoints the highest target that still passes the strict 80% bar. Takes ~25-40 minutes.")) return;
+    const r=await fetch('/api/v29/train',{method:'POST'});
+    const d=await r.json();
+    if(d.error) alert(`Error: ${d.error}`);
+    pollV29();
   };
 
   if(ld) return <div style={{color:"#475569",padding:40,textAlign:"center"}}>Loading...</div>;
@@ -1279,6 +1301,130 @@ function TrainingTab() {
                     })}
                   </div>
                 )}
+              </details>;
+            })}
+          </div>
+        )}
+      </Box>
+
+      {/* v29: FINE-GRAINED TARGET SWEEP — pinpoint where the 80% bar breaks */}
+      <Box>
+        <Lbl>Fine-Grained Target Sweep (v29) — find the highest target that still passes 80% bar</Lbl>
+        <div style={{fontSize:10,color:"#475569",marginBottom:10,lineHeight:1.5}}>
+          v28 showed +0.30% PASSES the strict 80% bar (0.9+ bucket 86.96%, CI lower 80.32%) and +0.40% FAILS. This sweep tests every 1bps target between them: +0.31%, +0.32%, ..., +0.40%. Each trains a separate LightGBM classifier with same features and strict validation as v28. Output: highest target where 0.8+ bucket still has n≥30 and CI lower ≥75%.
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:10}}>
+          <Btn onClick={runV29} disabled={v29Prog?.inProgress||ip||extProg?.inProgress||repairProg?.inProgress||convProg?.inProgress||patProg?.inProgress||v28Prog?.inProgress} color="#14b8a6" style={{padding:"8px 16px",fontSize:12}}>
+            {v29Prog?.inProgress?"Running...":"Run v29 Target Sweep"}
+          </Btn>
+          {v29Results && !v29Prog?.inProgress && (
+            <>
+              <Btn onClick={()=>downloadJson(v29Results,`v29_target_sweep_${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.json`)} color="#06b6d4" style={{padding:"8px 12px",fontSize:12}}>
+                Download JSON
+              </Btn>
+              <span style={{fontSize:11,color:"#64748b"}}>
+                Last run: {v29Results.generated_at?.slice(0,19).replace("T"," ")}
+              </span>
+            </>
+          )}
+        </div>
+        {v29Prog?.inProgress && (
+          <div style={{marginTop:10,marginBottom:10}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+              <div style={{flex:1,height:6,background:"rgba(255,255,255,0.06)",borderRadius:3,overflow:"hidden"}}>
+                <div style={{width:`${v29Prog.pct||0}%`,height:"100%",background:"#14b8a6",borderRadius:3,transition:"width 0.5s"}}/>
+              </div>
+              <span style={{fontSize:11,color:"#14b8a6",fontWeight:600}}>{v29Prog.pct||0}%</span>
+            </div>
+            <div style={{fontSize:11,color:"#64748b"}}>{v29Prog.message}</div>
+          </div>
+        )}
+        {!v29Prog?.inProgress && v29Prog?.phase === "error" && (
+          <div style={{marginTop:10,padding:"6px 10px",borderRadius:4,background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.2)"}}>
+            <div style={{fontSize:11,color:"#fca5a5",fontWeight:600}}>✗ {v29Prog.message}</div>
+          </div>
+        )}
+        {v29Results && (
+          <div style={{marginTop:14}}>
+            {/* Headline: highest passing target */}
+            <div style={{marginBottom:12,padding:"10px 14px",borderRadius:4,
+              background: v29Results.highest_passing_target?"rgba(34,197,94,0.08)":"rgba(234,179,8,0.08)",
+              border: `1px solid ${v29Results.highest_passing_target?"rgba(34,197,94,0.3)":"rgba(234,179,8,0.25)"}`}}>
+              <div style={{fontSize:10,color:"#64748b",fontWeight:600,textTransform:"uppercase",letterSpacing:0.3,marginBottom:3}}>Highest target passing strict 80% bar</div>
+              <div style={{fontSize:20,color:v29Results.highest_passing_target?"#22c55e":"#eab308",fontWeight:700}}>
+                {v29Results.highest_passing_target ? `+${v29Results.highest_passing_target}` : "none in range"}
+              </div>
+              <div style={{fontSize:11,color:"#94a3b8",marginTop:4}}>
+                {v29Results.n_passing_targets}/10 targets pass. Targets tested: +{v29Results.config?.targets_tested?.join(", +")}
+              </div>
+            </div>
+
+            {/* Per-target sweep summary table */}
+            <table style={{width:"100%",fontSize:11,borderCollapse:"collapse",marginBottom:14}}>
+              <thead><tr>
+                {["Target","AUC","Base","0.8-0.9 n","0.8-0.9 hit%","0.8-0.9 CI lower","0.9+ n","0.9+ hit%","0.9+ CI lower","Verdict"].map(col=>
+                  <th key={col} style={{padding:"4px 6px",textAlign:"left",color:"#64748b",fontSize:9,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase"}}>{col}</th>)}
+              </tr></thead>
+              <tbody>
+                {(v29Results.config?.targets_tested||[]).map(tlabel=>{
+                  const t = v29Results.per_target?.[tlabel];
+                  if (!t || t.error) return <tr key={tlabel} style={{borderTop:"1px solid rgba(255,255,255,0.04)"}}>
+                    <td style={{padding:"4px 6px",color:"#e2e8f0"}}>+{tlabel}</td>
+                    <td colSpan={9} style={{padding:"4px 6px",color:"#ef4444"}}>{t?.error || "—"}</td>
+                  </tr>;
+                  const passes = t.verdict === "ACHIEVES_80_HIGH_CONFIDENCE";
+                  const b89 = (t.buckets||[]).find(b=>b.bucket==="0.8-0.9");
+                  const b90 = (t.buckets||[]).find(b=>b.bucket==="0.9+");
+                  const ci89ok = b89?.ci_lower_pct !== null && b89?.ci_lower_pct >= 75 && b89?.n >= 30;
+                  const ci90ok = b90?.ci_lower_pct !== null && b90?.ci_lower_pct >= 75 && b90?.n >= 30;
+                  const rowBg = passes ? "rgba(34,197,94,0.06)" : "transparent";
+                  return <tr key={tlabel} style={{borderTop:"1px solid rgba(255,255,255,0.04)",background:rowBg}}>
+                    <td style={{padding:"4px 6px",color:passes?"#22c55e":"#c4b5fd",fontWeight:600}}>+{tlabel}</td>
+                    <td style={{padding:"4px 6px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{t.auc_test}</td>
+                    <td style={{padding:"4px 6px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{t.base_rates?.test}%</td>
+                    <td style={{padding:"4px 6px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{b89?.n ?? "—"}</td>
+                    <td style={{padding:"4px 6px",color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>{b89?.hit_rate_pct!=null?`${b89.hit_rate_pct}%`:"—"}</td>
+                    <td style={{padding:"4px 6px",color:ci89ok?"#22c55e":"#94a3b8",fontVariantNumeric:"tabular-nums",fontWeight:ci89ok?600:400}}>{b89?.ci_lower_pct!=null?`${b89.ci_lower_pct}%`:"—"}</td>
+                    <td style={{padding:"4px 6px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{b90?.n ?? "—"}</td>
+                    <td style={{padding:"4px 6px",color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>{b90?.hit_rate_pct!=null?`${b90.hit_rate_pct}%`:"—"}</td>
+                    <td style={{padding:"4px 6px",color:ci90ok?"#22c55e":"#94a3b8",fontVariantNumeric:"tabular-nums",fontWeight:ci90ok?600:400}}>{b90?.ci_lower_pct!=null?`${b90.ci_lower_pct}%`:"—"}</td>
+                    <td style={{padding:"4px 6px",fontWeight:700,fontSize:10,letterSpacing:0.3,color:passes?"#22c55e":"#eab308"}}>
+                      {passes ? "✓ PASSES" : "✗ below"}
+                    </td>
+                  </tr>;
+                })}
+              </tbody>
+            </table>
+
+            {/* Expandable detail per target */}
+            {(v29Results.config?.targets_tested||[]).map(tlabel=>{
+              const t = v29Results.per_target?.[tlabel];
+              if (!t || t.error) return null;
+              const passes = t.verdict === "ACHIEVES_80_HIGH_CONFIDENCE";
+              return <details key={"v29-"+tlabel} style={{marginBottom:4}} open={passes}>
+                <summary style={{cursor:"pointer",padding:"3px 8px",borderRadius:4,
+                  background:passes?"rgba(34,197,94,0.04)":"rgba(255,255,255,0.02)",
+                  border:`1px solid ${passes?"rgba(34,197,94,0.2)":"rgba(255,255,255,0.04)"}`,fontSize:10}}>
+                  <span style={{color:passes?"#22c55e":"#c4b5fd",fontWeight:600}}>+{tlabel} full calibration</span>
+                </summary>
+                <table style={{width:"100%",fontSize:10,borderCollapse:"collapse",marginTop:4,marginBottom:4}}>
+                  <thead><tr>
+                    {["Bucket","n","Hit%","CI 95%","Mean Pred"].map(col=>
+                      <th key={col} style={{padding:"2px 8px",textAlign:"left",color:"#64748b",fontSize:9,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase"}}>{col}</th>)}
+                  </tr></thead>
+                  <tbody>
+                    {(t.buckets||[]).map((b,bi)=>{
+                      const isHigh = b.bucket==="0.8-0.9" || b.bucket==="0.9+";
+                      return <tr key={bi} style={{borderTop:"1px solid rgba(255,255,255,0.03)",background:isHigh?"rgba(139,92,246,0.04)":"transparent"}}>
+                        <td style={{padding:"2px 8px",color:isHigh?"#c4b5fd":"#e2e8f0",fontWeight:isHigh?600:400}}>{b.bucket}</td>
+                        <td style={{padding:"2px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{b.n}</td>
+                        <td style={{padding:"2px 8px",color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>{b.hit_rate_pct!=null?`${b.hit_rate_pct}%`:"—"}</td>
+                        <td style={{padding:"2px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums",fontSize:9}}>{b.ci_lower_pct!=null?`[${b.ci_lower_pct}%, ${b.ci_upper_pct}%]`:"—"}</td>
+                        <td style={{padding:"2px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{b.mean_predicted_prob!=null?`${(b.mean_predicted_prob*100).toFixed(1)}%`:"—"}</td>
+                      </tr>;
+                    })}
+                  </tbody>
+                </table>
               </details>;
             })}
           </div>
