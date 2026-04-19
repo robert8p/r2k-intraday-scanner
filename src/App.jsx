@@ -543,6 +543,21 @@ function TrainingTab() {
     return ()=>clearInterval(iv);
   },[pollPat]);
 
+  // v28: cost-adjusted analysis state
+  const [v28Prog, setV28Prog] = useState(null);
+  const [v28Results, setV28Results] = useState(null);
+  const pollV28 = useCallback(()=>{
+    fetch('/api/v28/progress').then(r=>r.json()).then(setV28Prog).catch(()=>{});
+    fetch('/api/v28/results').then(r=>r.json()).then(d=>{
+      if (d && !d.status) setV28Results(d);
+    }).catch(()=>{});
+  },[]);
+  useEffect(()=>{
+    pollV28();
+    const iv=setInterval(pollV28, 3000);
+    return ()=>clearInterval(iv);
+  },[pollV28]);
+
   const trigTrain=async()=>{
     await fetch('/api/train',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({tp_mult:tp,sl_mult:sl})});
@@ -581,6 +596,13 @@ function TrainingTab() {
     const d=await r.json();
     if(d.error) alert(`Error: ${d.error}`);
     pollPat();
+  };
+  const runV28=async()=>{
+    if(!confirm("Run v28 cost-adjusted analysis? Runs BOTH LightGBM calibration AND decision-tree pattern discovery across 3 cost-adjusted targets (+0.30%, +0.40%, +0.50%). Takes ~30-45 minutes.")) return;
+    const r=await fetch('/api/v28/train',{method:'POST'});
+    const d=await r.json();
+    if(d.error) alert(`Error: ${d.error}`);
+    pollV28();
   };
 
   if(ld) return <div style={{color:"#475569",padding:40,textAlign:"center"}}>Loading...</div>;
@@ -1063,6 +1085,201 @@ function TrainingTab() {
                   </div>;
                 })}
               </div>;
+            })}
+          </div>
+        )}
+      </Box>
+
+      {/* v28: COST-ADJUSTED ANALYSIS — LightGBM + pattern discovery across 0.30/0.40/0.50 */}
+      <Box>
+        <Lbl>Cost-Adjusted Analysis (v28) — LightGBM + pattern discovery across round-trip-cost targets</Lbl>
+        <div style={{fontSize:10,color:"#475569",marginBottom:10,lineHeight:1.5}}>
+          Retargets prediction at thresholds derived from round-trip transaction cost: +0.30% (best-case tight spreads), +0.40% (typical R2K cost), +0.50% (conservative). For each target, runs BOTH: (A) LightGBM calibrated classifier at same strict validation as v26; (B) decision-tree pattern discovery at same strict validation as v27. If any combination produces a high-confidence bucket or validated rule, we have a deployable cost-positive signal.
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:10}}>
+          <Btn onClick={runV28} disabled={v28Prog?.inProgress||ip||extProg?.inProgress||repairProg?.inProgress||convProg?.inProgress||patProg?.inProgress} color="#ec4899" style={{padding:"8px 16px",fontSize:12}}>
+            {v28Prog?.inProgress?"Running...":"Run v28 Cost-Adjusted Analysis"}
+          </Btn>
+          {v28Results && !v28Prog?.inProgress && (
+            <>
+              <Btn onClick={()=>downloadJson(v28Results,`v28_cost_adjusted_${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.json`)} color="#06b6d4" style={{padding:"8px 12px",fontSize:12}}>
+                Download JSON
+              </Btn>
+              <span style={{fontSize:11,color:"#64748b"}}>
+                Last run: {v28Results.generated_at?.slice(0,19).replace("T"," ")}
+              </span>
+            </>
+          )}
+        </div>
+        {v28Prog?.inProgress && (
+          <div style={{marginTop:10,marginBottom:10}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+              <div style={{flex:1,height:6,background:"rgba(255,255,255,0.06)",borderRadius:3,overflow:"hidden"}}>
+                <div style={{width:`${v28Prog.pct||0}%`,height:"100%",background:"#ec4899",borderRadius:3,transition:"width 0.5s"}}/>
+              </div>
+              <span style={{fontSize:11,color:"#ec4899",fontWeight:600}}>{v28Prog.pct||0}%</span>
+            </div>
+            <div style={{fontSize:11,color:"#64748b"}}>{v28Prog.message}</div>
+          </div>
+        )}
+        {!v28Prog?.inProgress && v28Prog?.phase === "error" && (
+          <div style={{marginTop:10,padding:"6px 10px",borderRadius:4,background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.2)"}}>
+            <div style={{fontSize:11,color:"#fca5a5",fontWeight:600}}>✗ {v28Prog.message}</div>
+          </div>
+        )}
+        {v28Results && (
+          <div style={{marginTop:14}}>
+            {/* Overall summary */}
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:8,marginBottom:14}}>
+              <div style={{padding:"8px 12px",borderRadius:4,
+                background:v28Results.lgbm_passing_targets>0?"rgba(34,197,94,0.08)":"rgba(234,179,8,0.08)",
+                border:`1px solid ${v28Results.lgbm_passing_targets>0?"rgba(34,197,94,0.25)":"rgba(234,179,8,0.25)"}`}}>
+                <div style={{fontSize:10,color:"#64748b",fontWeight:600,letterSpacing:0.3,textTransform:"uppercase"}}>LightGBM passing</div>
+                <div style={{fontSize:18,color:v28Results.lgbm_passing_targets>0?"#22c55e":"#eab308",fontWeight:700}}>{v28Results.lgbm_passing_targets}/3 targets</div>
+              </div>
+              <div style={{padding:"8px 12px",borderRadius:4,
+                background:v28Results.pattern_passing_rules>0?"rgba(34,197,94,0.08)":"rgba(234,179,8,0.08)",
+                border:`1px solid ${v28Results.pattern_passing_rules>0?"rgba(34,197,94,0.25)":"rgba(234,179,8,0.25)"}`}}>
+                <div style={{fontSize:10,color:"#64748b",fontWeight:600,letterSpacing:0.3,textTransform:"uppercase"}}>Pattern rules passing</div>
+                <div style={{fontSize:18,color:v28Results.pattern_passing_rules>0?"#22c55e":"#eab308",fontWeight:700}}>{v28Results.pattern_passing_rules} rules</div>
+              </div>
+              <div style={{padding:"8px 12px",borderRadius:4,background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.04)"}}>
+                <div style={{fontSize:10,color:"#64748b",fontWeight:600,letterSpacing:0.3,textTransform:"uppercase"}}>Folds</div>
+                <div style={{fontSize:12,color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>
+                  tr={v28Results.fold_sizes?.train?.toLocaleString()} / va={v28Results.fold_sizes?.val?.toLocaleString()} / te={v28Results.fold_sizes?.test?.toLocaleString()}
+                </div>
+              </div>
+            </div>
+
+            {/* LightGBM results per target */}
+            <div style={{fontSize:11,color:"#e2e8f0",fontWeight:600,marginBottom:6,marginTop:10}}>LightGBM Calibration — per target</div>
+            <table style={{width:"100%",fontSize:11,borderCollapse:"collapse",marginBottom:16}}>
+              <thead><tr>
+                {["Target","AUC","Base (test)","Best high-conv bucket","Verdict"].map(col=>
+                  <th key={col} style={{padding:"4px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase"}}>{col}</th>)}
+              </tr></thead>
+              <tbody>
+                {["0.30%","0.40%","0.50%"].map(tlabel=>{
+                  const t = v28Results.lgbm_per_target?.[tlabel];
+                  if (!t || t.error) return <tr key={tlabel} style={{borderTop:"1px solid rgba(255,255,255,0.04)"}}>
+                    <td style={{padding:"4px 8px",color:"#e2e8f0"}}>+{tlabel}</td>
+                    <td colSpan={4} style={{padding:"4px 8px",color:"#ef4444"}}>{t?.error || "—"}</td>
+                  </tr>;
+                  const passes = t.verdict === "ACHIEVES_80_HIGH_CONFIDENCE";
+                  const highBuckets = (t.buckets||[]).filter(b=>["0.8-0.9","0.9+"].includes(b.bucket));
+                  const bestPass = highBuckets.find(b=>b.n>=30 && b.ci_lower_pct!=null && b.ci_lower_pct>=75);
+                  const bestAny = highBuckets.filter(b=>b.n>0).sort((a,b)=>(b.hit_rate_pct||0)-(a.hit_rate_pct||0))[0];
+                  const best = bestPass || bestAny;
+                  return <tr key={tlabel} style={{borderTop:"1px solid rgba(255,255,255,0.04)",background:passes?"rgba(34,197,94,0.06)":"transparent"}}>
+                    <td style={{padding:"4px 8px",color:"#c4b5fd",fontWeight:600}}>+{tlabel}</td>
+                    <td style={{padding:"4px 8px",color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>{t.auc_test}</td>
+                    <td style={{padding:"4px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{t.base_rates?.test}%</td>
+                    <td style={{padding:"4px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums",fontSize:10}}>
+                      {best ? `${best.bucket}: ${best.hit_rate_pct}% (n=${best.n}, CI ${best.ci_lower_pct}-${best.ci_upper_pct}%)` : "—"}
+                    </td>
+                    <td style={{padding:"4px 8px",fontWeight:700,fontSize:10,letterSpacing:0.3,color:passes?"#22c55e":"#eab308"}}>
+                      {passes ? "✓ PASSES 80%" : "✗ below bar"}
+                    </td>
+                  </tr>;
+                })}
+              </tbody>
+            </table>
+
+            {/* LightGBM detail per target (expandable) */}
+            {["0.30%","0.40%","0.50%"].map(tlabel=>{
+              const t = v28Results.lgbm_per_target?.[tlabel];
+              if (!t || t.error) return null;
+              const passes = t.verdict === "ACHIEVES_80_HIGH_CONFIDENCE";
+              return <details key={"lgbm-"+tlabel} style={{marginBottom:6}} open={passes}>
+                <summary style={{cursor:"pointer",padding:"4px 8px",borderRadius:4,
+                  background:passes?"rgba(34,197,94,0.06)":"rgba(255,255,255,0.02)",
+                  border:`1px solid ${passes?"rgba(34,197,94,0.25)":"rgba(255,255,255,0.04)"}`,fontSize:11}}>
+                  <span style={{color:"#c4b5fd",fontWeight:600}}>LightGBM calibration: +{tlabel}</span>
+                  <span style={{marginLeft:10,color:"#94a3b8"}}>(click to expand full bucket table)</span>
+                </summary>
+                <table style={{width:"100%",fontSize:11,borderCollapse:"collapse",marginTop:6,marginBottom:8}}>
+                  <thead><tr>
+                    {["Bucket","n","Hit%","CI 95%","Mean Pred","Status"].map(col=>
+                      <th key={col} style={{padding:"3px 8px",textAlign:"left",color:"#64748b",fontSize:9,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase"}}>{col}</th>)}
+                  </tr></thead>
+                  <tbody>
+                    {(t.buckets||[]).map((b,bi)=>{
+                      const isHigh = b.bucket==="0.8-0.9" || b.bucket==="0.9+";
+                      const bPass = isHigh && b.n>=30 && b.ci_lower_pct!=null && b.ci_lower_pct>=75;
+                      const hrColor = b.hit_rate_pct==null?"#64748b":b.hit_rate_pct>=75?"#22c55e":b.hit_rate_pct>=60?"#a3e635":b.hit_rate_pct>=50?"#eab308":b.hit_rate_pct>=40?"#94a3b8":"#ef4444";
+                      return <tr key={bi} style={{borderTop:"1px solid rgba(255,255,255,0.03)",background:isHigh?"rgba(139,92,246,0.04)":"transparent"}}>
+                        <td style={{padding:"3px 8px",color:isHigh?"#c4b5fd":"#e2e8f0",fontWeight:isHigh?600:400}}>{b.bucket}</td>
+                        <td style={{padding:"3px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{b.n}</td>
+                        <td style={{padding:"3px 8px",color:hrColor,fontVariantNumeric:"tabular-nums",fontWeight:600}}>{b.hit_rate_pct!=null?`${b.hit_rate_pct}%`:"—"}</td>
+                        <td style={{padding:"3px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums",fontSize:10}}>{b.ci_lower_pct!=null?`[${b.ci_lower_pct}%, ${b.ci_upper_pct}%]`:"—"}</td>
+                        <td style={{padding:"3px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{b.mean_predicted_prob!=null?`${(b.mean_predicted_prob*100).toFixed(1)}%`:"—"}</td>
+                        <td style={{padding:"3px 8px",fontSize:9,fontWeight:700,letterSpacing:0.3,color:bPass?"#22c55e":(isHigh && b.n>0?"#eab308":"#64748b")}}>
+                          {bPass?"✓":(isHigh && b.n>0?"✗":"")}
+                        </td>
+                      </tr>;
+                    })}
+                  </tbody>
+                </table>
+              </details>;
+            })}
+
+            {/* Pattern discovery per target x hour matrix */}
+            <div style={{fontSize:11,color:"#e2e8f0",fontWeight:600,marginBottom:6,marginTop:16}}>Pattern Discovery — per (target × hour)</div>
+            <table style={{width:"100%",fontSize:11,borderCollapse:"collapse",marginBottom:10}}>
+              <thead><tr>
+                <th style={{padding:"4px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase"}}>Target</th>
+                {SCAN_HOURS.map(h=>
+                  <th key={h} style={{padding:"4px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase",borderLeft:"1px solid rgba(255,255,255,0.08)"}}>{h}:00</th>
+                )}
+              </tr></thead>
+              <tbody>
+                {["0.30%","0.40%","0.50%"].map(tlabel=>{
+                  const tData = v28Results.pattern_per_target?.[tlabel] || {};
+                  return <tr key={tlabel} style={{borderTop:"1px solid rgba(255,255,255,0.04)"}}>
+                    <td style={{padding:"4px 8px",color:"#c4b5fd",fontWeight:600}}>+{tlabel}</td>
+                    {SCAN_HOURS.map(h=>{
+                      const cell = tData[String(h)];
+                      if (!cell) return <td key={h} style={{padding:"4px 8px",borderLeft:"1px solid rgba(255,255,255,0.08)",color:"#475569"}}>—</td>;
+                      const anyPass = cell.n_passing_strict > 0;
+                      return <td key={h} style={{padding:"4px 8px",borderLeft:"1px solid rgba(255,255,255,0.08)",background:anyPass?"rgba(34,197,94,0.08)":"transparent"}}>
+                        <div style={{fontSize:10,color:anyPass?"#22c55e":"#94a3b8",fontWeight:anyPass?700:500}}>
+                          {anyPass?`✓ ${cell.n_passing_strict} rule(s)`:"✗ 0 pass"}
+                        </div>
+                        <div style={{fontSize:9,color:"#64748b",fontVariantNumeric:"tabular-nums",marginTop:2}}>
+                          base {cell.base_rate_test}% · cand {cell.n_candidates} → val {cell.n_validated}
+                        </div>
+                      </td>;
+                    })}
+                  </tr>;
+                })}
+              </tbody>
+            </table>
+
+            {/* Pattern detail: show validated rules for any passing cells */}
+            {["0.30%","0.40%","0.50%"].map(tlabel=>{
+              const tData = v28Results.pattern_per_target?.[tlabel] || {};
+              const passingCells = Object.entries(tData).filter(([h,c])=>c.n_passing_strict > 0);
+              if (passingCells.length === 0) return null;
+              return <details key={"pat-"+tlabel} open style={{marginTop:10,marginBottom:6}}>
+                <summary style={{cursor:"pointer",padding:"4px 8px",borderRadius:4,
+                  background:"rgba(34,197,94,0.06)",border:"1px solid rgba(34,197,94,0.25)",fontSize:11}}>
+                  <span style={{color:"#22c55e",fontWeight:600}}>✓ Passing pattern rules for +{tlabel}</span>
+                </summary>
+                {passingCells.map(([h,cell])=>
+                  <div key={h} style={{marginTop:6,padding:"6px 10px",borderRadius:4,background:"rgba(255,255,255,0.02)"}}>
+                    <div style={{fontSize:11,color:"#e2e8f0",fontWeight:600,marginBottom:4}}>{h}:00 ET</div>
+                    {cell.validated_rules.filter(r=>r.passes_strict).map((r,ri)=>{
+                      const condStr = r.conditions.map(c=>`${c[0]} ${c[1]} ${typeof c[2]==="number"?c[2].toFixed(3):c[2]}`).join(" AND ");
+                      return <div key={ri} style={{fontSize:10,color:"#94a3b8",marginBottom:3}}>
+                        <span style={{color:"#22c55e",fontWeight:700,marginRight:6}}>
+                          test hr {(r.test_hit_rate*100).toFixed(1)}% (n={r.test_n}, CI {(r.test_ci_lower*100).toFixed(1)}-{(r.test_ci_upper*100).toFixed(1)}%)
+                        </span>
+                        <span style={{fontFamily:F,color:"#e2e8f0"}}>{condStr}</span>
+                      </div>;
+                    })}
+                  </div>
+                )}
+              </details>;
             })}
           </div>
         )}

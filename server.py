@@ -5315,6 +5315,435 @@ def run_pattern_discovery():
         pattern_discovery_in_progress = False
 
 
+# ═══════════════════════════════════════════════════════════════════
+# v28: COST-ADJUSTED ANALYSIS
+# Runs BOTH the v25-style LightGBM calibration AND the v27-style pattern
+# discovery across three targets: +0.30%, +0.40%, +0.50%. These targets
+# are derived from round-trip cost estimates (commission 0% on Alpaca,
+# plus bid-ask spread and slippage) — represent the minimum price move
+# needed for a profitable round-trip.
+#
+# Target 1 (0.30%): Best-case (tight spreads, good fills)
+# Target 2 (0.40%): Typical R2K round-trip cost
+# Target 3 (0.50%): Conservative (wider spreads, some slippage)
+#
+# For each target: one LightGBM calibrated model + one decision-tree
+# pattern discovery analysis per scan hour. Same strict validation bars
+# as v25/v26 and v27.
+# ═══════════════════════════════════════════════════════════════════
+V28_RESULTS_PATH = DATA_DIR / "v28_cost_adjusted_results.json"
+v28_in_progress = False
+v28_progress = {"phase":"idle","pct":0,"message":""}
+
+def run_v28_cost_adjusted():
+    """Run LightGBM + pattern discovery across 3 cost-adjusted targets."""
+    global v28_in_progress, v28_progress
+    if v28_in_progress:
+        log.warning("v28 already running"); return
+    v28_in_progress = True
+    v28_progress = {"phase":"starting","pct":0,"message":"Starting v28 cost-adjusted analysis..."}
+
+    try:
+        if not (BARS_DAILY_CACHE.exists() and BARS_INTRADAY_CACHE.exists()):
+            raise RuntimeError("No bar cache. Run Training first.")
+
+        import numpy as _np
+        try:
+            from sklearn.tree import DecisionTreeClassifier, _tree
+        except Exception as e:
+            raise RuntimeError(f"sklearn.tree not available: {e}")
+        from sklearn.metrics import roc_auc_score as _auc
+
+        v28_progress = {"phase":"loading","pct":2,"message":"Loading bars..."}
+        daily_bars = pickle.loads(BARS_DAILY_CACHE.read_bytes())
+        intraday_bars = pickle.loads(BARS_INTRADAY_CACHE.read_bytes())
+
+        iwm_daily = daily_bars.get("IWM", [])
+        if len(iwm_daily) < 200:
+            raise RuntimeError("Insufficient IWM history")
+        all_dates_list = sorted(set(b["t"][:10] for b in iwm_daily))
+        n_dates = len(all_dates_list)
+        split_tr = int(n_dates * 0.60)
+        split_va = int(n_dates * 0.80)
+        train_dates = set(all_dates_list[:split_tr])
+        val_dates = set(all_dates_list[split_tr:split_va])
+        test_dates = set(all_dates_list[split_va:])
+        log.info(f"v28: {len(train_dates)}/{len(val_dates)}/{len(test_dates)} train/val/test dates")
+
+        def bars_for_date(ticker, date):
+            return [b for b in intraday_bars.get(ticker, []) if b["t"][:10] == date]
+        def daily_up_to(ticker, date):
+            return [b for b in daily_bars.get(ticker, []) if b["t"][:10] < date]
+
+        base_feat_names = FEATURE_NAMES
+        setup_feat_names = [f"setup_{s}" for s in SETUP_NAMES]
+        all_feat_names_hourless = base_feat_names + setup_feat_names
+        all_feat_names_lgbm = base_feat_names + setup_feat_names + ["hour_11","hour_12","hour_13","hour_14","hour_15"]
+
+        tickers_list = [t for t in TICKERS if t not in ("SPY", "IWM")]
+        scan_hours = SCAN_HOURS
+        TARGET_PCTS = [0.0030, 0.0040, 0.0050]  # cost-adjusted thresholds
+        TARGET_LABELS = ["0.30%", "0.40%", "0.50%"]
+
+        # Build shared feature cache (one pass, used by BOTH frameworks)
+        v28_progress = {"phase":"features","pct":5,"message":"Building features..."}
+        # Per-hour separation used by pattern discovery; flat list used by LightGBM
+        examples_per_hour = {h: {"train": [], "val": [], "test": []} for h in scan_hours}
+        all_examples = []  # with fold, hour attached
+
+        for di, date in enumerate(all_dates_list):
+            if (di + 1) % 10 == 0:
+                pct = 5 + int((di / n_dates) * 45)
+                v28_progress = {"phase":"features","pct":pct,
+                    "message":f"Building features for date {di+1}/{n_dates}..."}
+            fold = "train" if date in train_dates else ("val" if date in val_dates else "test")
+
+            spy_intraday_date = [b for b in intraday_bars.get("SPY", []) if b["t"][:10] == date]
+            iwm_intraday_date = [b for b in intraday_bars.get("IWM", []) if b["t"][:10] == date]
+
+            for scan_hour in scan_hours:
+                scan_minute_et = scan_hour * 60
+                spy_before = [b for b in spy_intraday_date if (bar_to_et_minutes(b) or -1) < scan_minute_et]
+                iwm_before = [b for b in iwm_intraday_date if (bar_to_et_minutes(b) or -1) < scan_minute_et]
+                spy_ctx = compute_spy_context(spy_before) if spy_before else None
+
+                sector_green_count = defaultdict(lambda: [0, 0])
+                cache_per_tkr = {}
+                for tkr in tickers_list:
+                    tbars = bars_for_date(tkr, date)
+                    if len(tbars) < 6: continue
+                    tb = [b for b in tbars if (bar_to_et_minutes(b) or -1) < scan_minute_et]
+                    ta = [b for b in tbars if (bar_to_et_minutes(b) or -1) >= scan_minute_et]
+                    if len(tb) < 6 or len(ta) < 2: continue
+                    dl = daily_up_to(tkr, date)
+                    pc = dl[-1]["c"] if dl else None
+                    if pc is None: continue
+                    sp = tb[-1]["c"]
+                    sec = SECTORS.get(tkr, "?")
+                    sector_green_count[sec][1] += 1
+                    if sp > pc: sector_green_count[sec][0] += 1
+                    cache_per_tkr[tkr] = (tb, ta, sp, pc, dl, sec)
+
+                date_hour_rows = []
+                for ticker, (before, after, scan_price, prev_close, dl, sec) in cache_per_tkr.items():
+                    open_price = before[0]["o"]
+                    feat = compute_features(before, dl, scan_price, open_price, scan_hour,
+                                            spy_context=spy_ctx, prev_close=prev_close)
+                    if feat is None: continue
+                    sgc = sector_green_count[sec]
+                    breadth = sgc[0] / sgc[1] if sgc[1] > 0 else 0
+                    active = detect_setups(before, scan_price, prev_close,
+                                           sector_breadth=breadth, prior_daily=dl,
+                                           iwm_bars=iwm_before, scan_minute_et=scan_minute_et)
+                    setup_flags = {f"setup_{s}": int(bool(active[s])) for s in SETUP_NAMES}
+
+                    # Compute 3 target labels (by-close, no horizon bounding)
+                    labels = {}
+                    for tp in TARGET_PCTS:
+                        hit, _ = did_hit_target(scan_price, after[1:], target_pct=tp)
+                        labels[f"t{int(tp*10000)}"] = 1 if hit else 0
+
+                    date_hour_rows.append({
+                        "feat": feat, "setup_flags": setup_flags, "sector": sec, "labels": labels,
+                    })
+
+                if len(date_hour_rows) < 10: continue
+                feats_list = [r["feat"] for r in date_hour_rows]
+                sectors_list = [r["sector"] for r in date_hour_rows]
+                add_ranks(feats_list)
+                add_sector_relative(feats_list, sectors_list)
+
+                for r in date_hour_rows:
+                    vec_hourless = [float(r["feat"].get(k, 0.0) or 0.0) for k in base_feat_names]
+                    vec_hourless += [float(r["setup_flags"].get(k, 0)) for k in setup_feat_names]
+                    vec_lgbm = list(vec_hourless) + [1.0 if scan_hour == h else 0.0 for h in [11,12,13,14,15]]
+                    rec = {
+                        "vec_hourless": vec_hourless,
+                        "vec_lgbm": vec_lgbm,
+                        "labels": r["labels"],
+                        "hour": scan_hour, "fold": fold,
+                    }
+                    examples_per_hour[scan_hour][fold].append(rec)
+                    all_examples.append(rec)
+
+        total_ex = len(all_examples)
+        log.info(f"v28: built {total_ex} examples")
+
+        if total_ex < 1000:
+            raise RuntimeError(f"Insufficient examples: {total_ex}")
+
+        # ═══════════════════════════════════════════════════════════════
+        # FRAMEWORK A: LightGBM calibration per target
+        # ═══════════════════════════════════════════════════════════════
+        v28_progress = {"phase":"lightgbm","pct":52,"message":"Training LightGBM (3 targets)..."}
+
+        # Build shared LightGBM matrices
+        def fold_idx(fold):
+            return _np.array([i for i, e in enumerate(all_examples) if e["fold"] == fold], dtype=_np.int32)
+        train_idx = fold_idx("train"); val_idx = fold_idx("val"); test_idx = fold_idx("test")
+        X_all_lgbm = _np.array([e["vec_lgbm"] for e in all_examples], dtype=_np.float32)
+        X_train_lgbm = X_all_lgbm[train_idx]
+        X_val_lgbm = X_all_lgbm[val_idx]
+        X_test_lgbm = X_all_lgbm[test_idx]
+        log.info(f"LightGBM shapes: train={X_train_lgbm.shape}, val={X_val_lgbm.shape}, test={X_test_lgbm.shape}")
+
+        lgbm_params = {
+            "objective": "binary", "metric": "binary_logloss",
+            "learning_rate": 0.05, "num_leaves": 31, "min_data_in_leaf": 50,
+            "feature_fraction": 0.9, "bagging_fraction": 0.85, "bagging_freq": 5,
+            "lambda_l2": 1.0, "verbose": -1,
+        }
+        buckets_def = [
+            (0.0, 0.3, "0.0-0.3"), (0.3, 0.4, "0.3-0.4"), (0.4, 0.5, "0.4-0.5"),
+            (0.5, 0.6, "0.5-0.6"), (0.6, 0.7, "0.6-0.7"), (0.7, 0.8, "0.7-0.8"),
+            (0.8, 0.9, "0.8-0.9"), (0.9, 1.01, "0.9+"),
+        ]
+
+        lgbm_per_target = {}
+        for ti, (tp, tlabel) in enumerate(zip(TARGET_PCTS, TARGET_LABELS)):
+            tkey = f"t{int(tp*10000)}"
+            pct_done = 52 + int((ti / len(TARGET_PCTS)) * 18)
+            v28_progress = {"phase":"lightgbm","pct":pct_done,
+                "message":f"LightGBM {ti+1}/3: {tlabel}"}
+
+            y_train = _np.array([all_examples[i]["labels"][tkey] for i in train_idx], dtype=_np.int32)
+            y_val = _np.array([all_examples[i]["labels"][tkey] for i in val_idx], dtype=_np.int32)
+            y_test = _np.array([all_examples[i]["labels"][tkey] for i in test_idx], dtype=_np.int32)
+
+            train_ds = lgb.Dataset(X_train_lgbm, label=y_train, feature_name=all_feat_names_lgbm)
+            val_ds = lgb.Dataset(X_val_lgbm, label=y_val, feature_name=all_feat_names_lgbm, reference=train_ds)
+            try:
+                model = lgb.train(
+                    lgbm_params, train_ds, num_boost_round=500,
+                    valid_sets=[val_ds], valid_names=["val"],
+                    callbacks=[lgb.early_stopping(30), lgb.log_evaluation(0)],
+                )
+            except Exception as e:
+                log.error(f"LightGBM {tlabel} failed: {e}")
+                lgbm_per_target[tlabel] = {"error": str(e)}
+                continue
+
+            raw_val = model.predict(X_val_lgbm, num_iteration=model.best_iteration)
+            calibrator = IsotonicRegression(out_of_bounds="clip")
+            calibrator.fit(raw_val, y_val)
+            raw_test = model.predict(X_test_lgbm, num_iteration=model.best_iteration)
+            calib_test = calibrator.transform(raw_test)
+            try:
+                auc_test = round(_auc(y_test, raw_test), 4)
+            except Exception:
+                auc_test = None
+
+            bucket_stats = []
+            for lo, hi, lbl in buckets_def:
+                mask = (calib_test >= lo) & (calib_test < hi)
+                n = int(mask.sum())
+                if n == 0:
+                    bucket_stats.append({"bucket": lbl, "n": 0, "n_hits": 0,
+                        "hit_rate_pct": None, "ci_lower_pct": None, "ci_upper_pct": None,
+                        "mean_predicted_prob": None})
+                    continue
+                hits = int(y_test[mask].sum())
+                lower, upper = wilson_ci(hits, n)
+                bucket_stats.append({
+                    "bucket": lbl, "n": n, "n_hits": hits,
+                    "hit_rate_pct": round(hits / n * 100, 2),
+                    "ci_lower_pct": round(lower * 100, 2),
+                    "ci_upper_pct": round(upper * 100, 2),
+                    "mean_predicted_prob": round(float(calib_test[mask].mean()), 3),
+                })
+
+            pass_buckets = [b for b in bucket_stats
+                            if b["bucket"] in ("0.8-0.9", "0.9+")
+                            and b["n"] and b["n"] >= 30
+                            and b["ci_lower_pct"] is not None and b["ci_lower_pct"] >= 75]
+            verdict = "ACHIEVES_80_HIGH_CONFIDENCE" if pass_buckets else "DOES_NOT_ACHIEVE_80"
+
+            imp_raw = model.feature_importance(importance_type="gain")
+            feat_imp = sorted([(n, float(v)) for n, v in zip(all_feat_names_lgbm, imp_raw)],
+                              key=lambda x: -x[1])
+            total_imp = sum(v for _, v in feat_imp) or 1
+            feat_imp_pct = [(n, round(v / total_imp * 100, 2)) for n, v in feat_imp]
+
+            lgbm_per_target[tlabel] = {
+                "target_pct": tlabel,
+                "base_rates": {
+                    "train": round(float(y_train.mean()) * 100, 2),
+                    "val": round(float(y_val.mean()) * 100, 2),
+                    "test": round(float(y_test.mean()) * 100, 2),
+                },
+                "auc_test": auc_test,
+                "buckets": bucket_stats,
+                "verdict": verdict,
+                "top_features": feat_imp_pct[:15],
+                "best_iteration": model.best_iteration,
+            }
+            log.info(f"LightGBM {tlabel}: AUC={auc_test}, verdict={verdict}")
+
+        # ═══════════════════════════════════════════════════════════════
+        # FRAMEWORK B: Decision tree pattern discovery per (hour × target)
+        # ═══════════════════════════════════════════════════════════════
+        v28_progress = {"phase":"pattern","pct":70,"message":"Pattern discovery..."}
+
+        def extract_rules_from_tree(tree, feat_names, min_leaf_n, min_hit_rate):
+            t = tree.tree_
+            FEAT_UNDEFINED = _tree.TREE_UNDEFINED
+            rules = []
+            def walk(node_id, conditions):
+                if t.feature[node_id] != FEAT_UNDEFINED:
+                    fname = feat_names[t.feature[node_id]]
+                    thresh = float(t.threshold[node_id])
+                    walk(t.children_left[node_id], conditions + [(fname, "<=", thresh)])
+                    walk(t.children_right[node_id], conditions + [(fname, ">", thresh)])
+                else:
+                    vals = t.value[node_id][0]
+                    n_total = int(vals.sum())
+                    n_pos = int(vals[1]) if len(vals) > 1 else 0
+                    if n_total >= min_leaf_n:
+                        hr = n_pos / n_total
+                        if hr >= min_hit_rate:
+                            rules.append({"conditions": conditions, "train_n": n_total,
+                                          "train_hits": n_pos, "train_hit_rate": hr})
+            walk(0, [])
+            return rules
+
+        def evaluate_rule_on_set(rule, vecs, labels, feat_idx):
+            mask = _np.ones(len(vecs), dtype=bool)
+            for (fname, op, thresh) in rule["conditions"]:
+                col = vecs[:, feat_idx[fname]]
+                mask &= (col <= thresh) if op == "<=" else (col > thresh)
+            n_match = int(mask.sum())
+            n_hits = int(labels[mask].sum()) if n_match > 0 else 0
+            return n_match, n_hits
+
+        feat_idx = {n: i for i, n in enumerate(all_feat_names_hourless)}
+        pattern_per_target = {}  # tlabel → per_hour dict
+
+        total_cells = len(scan_hours) * len(TARGET_PCTS)
+        cell_i = 0
+        for tp, tlabel in zip(TARGET_PCTS, TARGET_LABELS):
+            tkey = f"t{int(tp*10000)}"
+            pattern_per_target[tlabel] = {}
+
+            for h in scan_hours:
+                cell_i += 1
+                pct_done = 70 + int((cell_i / total_cells) * 28)
+                v28_progress = {"phase":"pattern","pct":pct_done,
+                    "message":f"Pattern {tlabel} × {h}:00 ({cell_i}/{total_cells})"}
+
+                hour_ex = examples_per_hour[h]
+                if not hour_ex["train"] or not hour_ex["test"]:
+                    continue
+                X_tr = _np.array([e["vec_hourless"] for e in hour_ex["train"]], dtype=_np.float32)
+                X_te = _np.array([e["vec_hourless"] for e in hour_ex["test"]], dtype=_np.float32)
+                y_tr = _np.array([e["labels"][tkey] for e in hour_ex["train"]], dtype=_np.int32)
+                y_te = _np.array([e["labels"][tkey] for e in hour_ex["test"]], dtype=_np.int32)
+                train_base = float(y_tr.mean())
+                test_base = float(y_te.mean())
+
+                # Winner vs loser distribution
+                win_mask = (y_tr == 1); los_mask = (y_tr == 0)
+                distribution = []
+                for fn in all_feat_names_hourless:
+                    col = X_tr[:, feat_idx[fn]]
+                    wv = col[win_mask]; lv = col[los_mask]
+                    if len(wv) == 0 or len(lv) == 0: continue
+                    d_val = cohens_d(wv, lv)
+                    distribution.append({
+                        "feature": fn,
+                        "winner_mean": round(float(_np.mean(wv)), 4),
+                        "loser_mean": round(float(_np.mean(lv)), 4),
+                        "cohens_d": round(d_val, 3) if d_val is not None else None,
+                    })
+                distribution.sort(key=lambda x: -abs(x["cohens_d"] or 0))
+
+                # Strict thresholds
+                min_test_hr = test_base + 0.40
+                min_test_ci_lower = test_base + 0.30
+                min_train_hr = train_base + 0.40
+
+                clf = DecisionTreeClassifier(max_depth=4, min_samples_leaf=300,
+                                             criterion="gini", random_state=42)
+                clf.fit(X_tr, y_tr)
+                candidates = extract_rules_from_tree(clf, all_feat_names_hourless, 300, min_train_hr)
+
+                validated = []
+                for cand in candidates:
+                    n_match, n_hits = evaluate_rule_on_set(cand, X_te, y_te, feat_idx)
+                    if n_match < 30: continue
+                    test_hr = n_hits / n_match
+                    lower, upper = wilson_ci(n_hits, n_match)
+                    passes = test_hr >= min_test_hr and lower >= min_test_ci_lower
+                    validated.append({
+                        "conditions": cand["conditions"],
+                        "train_n": cand["train_n"],
+                        "train_hit_rate": round(cand["train_hit_rate"], 4),
+                        "test_n": n_match, "test_hits": n_hits,
+                        "test_hit_rate": round(test_hr, 4),
+                        "test_ci_lower": round(lower, 4),
+                        "test_ci_upper": round(upper, 4),
+                        "passes_strict": passes,
+                    })
+                validated.sort(key=lambda r: -r["test_hit_rate"])
+
+                pattern_per_target[tlabel][str(h)] = {
+                    "hour": h,
+                    "n_train": len(y_tr), "n_test": len(y_te),
+                    "base_rate_train": round(train_base * 100, 2),
+                    "base_rate_test": round(test_base * 100, 2),
+                    "min_test_hit_rate_required_pct": round(min_test_hr * 100, 2),
+                    "min_test_ci_lower_required_pct": round(min_test_ci_lower * 100, 2),
+                    "n_candidates": len(candidates),
+                    "n_validated": len(validated),
+                    "n_passing_strict": sum(1 for r in validated if r["passes_strict"]),
+                    "top_features": distribution[:15],
+                    "validated_rules": validated[:20],
+                }
+
+        # Aggregate verdict
+        total_passing_pattern = sum(
+            cell.get("n_passing_strict", 0)
+            for tlabel_data in pattern_per_target.values()
+            for cell in tlabel_data.values()
+        )
+        total_passing_lgbm = sum(
+            1 for t in lgbm_per_target.values()
+            if t.get("verdict") == "ACHIEVES_80_HIGH_CONFIDENCE"
+        )
+
+        results = {
+            "generated_at": datetime.now(ET).isoformat(),
+            "config": {
+                "targets_pct": [0.30, 0.40, 0.50],
+                "scan_hours": scan_hours,
+                "tree_max_depth": 4,
+                "min_samples_leaf_train": 300,
+                "lgbm_bucket_pass_n_min": 30,
+                "lgbm_bucket_pass_ci_lower_min_pct": 75,
+                "pattern_test_hit_threshold_pp_above_base": 40,
+                "pattern_test_ci_lower_pp_above_base": 30,
+            },
+            "fold_sizes": {"train": len(train_idx), "val": len(val_idx), "test": len(test_idx)},
+            "n_features_lgbm": len(all_feat_names_lgbm),
+            "n_features_pattern": len(all_feat_names_hourless),
+            "lgbm_passing_targets": total_passing_lgbm,
+            "pattern_passing_rules": total_passing_pattern,
+            "lgbm_per_target": lgbm_per_target,
+            "pattern_per_target": pattern_per_target,
+        }
+        V28_RESULTS_PATH.write_text(json.dumps(results, indent=2, default=str))
+
+        log.info(f"v28 complete. LightGBM passing: {total_passing_lgbm}/3, Pattern passing: {total_passing_pattern}")
+        v28_progress = {"phase":"done","pct":100,
+            "message":f"Done. LightGBM {total_passing_lgbm}/3 targets pass; {total_passing_pattern} pattern rules pass."}
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        log.error(f"v28 failed: {e}\n{tb}", exc_info=True)
+        v28_progress = {"phase":"error","pct":0,"message":str(e)}
+    finally:
+        v28_in_progress = False
+
+
 # Evidence-quality thresholds for declaring a setup tradable at a given hour.
 # A setup is "active" only at scan hours where it survived test-fold evaluation.
 # These thresholds are deliberately conservative.
@@ -6352,6 +6781,32 @@ def pattern_results_endpoint():
         return json.loads(PATTERN_RESULTS_PATH.read_text())
     except Exception as e:
         return JSONResponse({"error":str(e)},500)
+
+# v28: cost-adjusted analysis endpoints (runs LightGBM + pattern both, across 3 targets)
+@app.post("/api/v28/train")
+def trigger_v28(bg: BackgroundTasks):
+    if v28_in_progress: return {"status":"already_running"}
+    if (training_in_progress or setup_eval_in_progress or
+        conviction_train_in_progress or pattern_discovery_in_progress):
+        return JSONResponse({"error":"Another task running"},400)
+    if not (BARS_DAILY_CACHE.exists() and BARS_INTRADAY_CACHE.exists()):
+        return JSONResponse({"error":"Bar cache missing"},400)
+    bg.add_task(run_v28_cost_adjusted)
+    return {"status":"started"}
+
+@app.get("/api/v28/progress")
+def v28_progress_endpoint():
+    return {"inProgress":v28_in_progress, **v28_progress}
+
+@app.get("/api/v28/results")
+def v28_results_endpoint():
+    if not V28_RESULTS_PATH.exists():
+        return {"status":"no_results"}
+    try:
+        return json.loads(V28_RESULTS_PATH.read_text())
+    except Exception as e:
+        return JSONResponse({"error":str(e)},500)
+
 
 
 
