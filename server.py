@@ -3826,24 +3826,52 @@ def run_setup_evaluation(target_pct=0.01):
                         round((n_setup - full_n_setup) / full_n_setup * 100, 1) if full_n_setup > 0 else None
                     )
 
-                # Simple verdict per setup
-                mid_delta_disc = per_setup["mid_hi"].get("edge_delta_disc")
-                mid_delta_val = per_setup["mid_hi"].get("edge_delta_val")
-                if mid_delta_disc is not None and mid_delta_val is not None:
-                    if mid_delta_disc >= 1.0 and mid_delta_val >= 1.0:
-                        verdict = "IMPROVES"
-                    elif mid_delta_disc >= 0.5 and mid_delta_val >= 0.5:
-                        verdict = "MARGINAL"
-                    elif abs(mid_delta_disc) < 0.5 and abs(mid_delta_val) < 0.5:
-                        verdict = "NEUTRAL"
-                    elif mid_delta_disc < -0.5 or mid_delta_val < -0.5:
-                        verdict = "HURTS"
-                    else:
-                        verdict = "INCONSISTENT"
-                else:
-                    verdict = "INSUFFICIENT"
+                # v31 FIX: previously verdict was computed ONLY from mid_hi, ignoring hi filter data.
+                # This meant cells with strong `hi` edge gains were being labeled HURTS/NEUTRAL based
+                # on weaker `mid_hi` performance, and the live scanner never got the stricter filter.
+                # Fix: compute verdict for BOTH filters, select the stronger one per setup-hour.
+                def _verdict_from_deltas(disc, val):
+                    if disc is None or val is None: return "INSUFFICIENT"
+                    if disc >= 1.0 and val >= 1.0: return "IMPROVES"
+                    if disc >= 0.5 and val >= 0.5: return "MARGINAL"
+                    if abs(disc) < 0.5 and abs(val) < 0.5: return "NEUTRAL"
+                    if disc < -0.5 or val < -0.5: return "HURTS"
+                    return "INCONSISTENT"
 
-                per_setup["verdict"] = verdict
+                mid_verdict = _verdict_from_deltas(
+                    per_setup["mid_hi"].get("edge_delta_disc"),
+                    per_setup["mid_hi"].get("edge_delta_val"),
+                )
+                hi_verdict = _verdict_from_deltas(
+                    per_setup["hi"].get("edge_delta_disc"),
+                    per_setup["hi"].get("edge_delta_val"),
+                )
+                per_setup["verdict_mid_hi"] = mid_verdict
+                per_setup["verdict_hi"] = hi_verdict
+
+                # Select the best filter:
+                # - If both IMPROVES, pick the one with higher avg edge delta
+                # - If one IMPROVES and other not, pick the improving one
+                # - Otherwise pick the better verdict in ranking order
+                verdict_rank = {"IMPROVES": 5, "MARGINAL": 4, "NEUTRAL": 3, "INCONSISTENT": 2, "HURTS": 1, "INSUFFICIENT": 0}
+                mid_rank = verdict_rank.get(mid_verdict, 0)
+                hi_rank = verdict_rank.get(hi_verdict, 0)
+                if hi_verdict == "IMPROVES" and mid_verdict == "IMPROVES":
+                    # Both pass — pick higher avg edge delta
+                    def _avg(d): return (d.get("edge_delta_disc") or 0 + d.get("edge_delta_val") or 0) / 2.0
+                    mid_avg = (per_setup["mid_hi"].get("edge_delta_disc") or 0) + (per_setup["mid_hi"].get("edge_delta_val") or 0)
+                    hi_avg = (per_setup["hi"].get("edge_delta_disc") or 0) + (per_setup["hi"].get("edge_delta_val") or 0)
+                    selected = "hi" if hi_avg > mid_avg else "mid_hi"
+                elif hi_rank > mid_rank:
+                    selected = "hi"
+                elif mid_rank > hi_rank:
+                    selected = "mid_hi"
+                else:
+                    # Tie — prefer mid_hi (less volume cut)
+                    selected = "mid_hi"
+
+                per_setup["selected_filter"] = selected
+                per_setup["verdict"] = per_setup[f"verdict_{selected}"]
                 hour_result["setups"][s] = per_setup
 
             atr_filter_result["by_hour"][str(h)] = hour_result
@@ -4210,14 +4238,21 @@ def run_setup_evaluation(target_pct=0.01):
 
         # Derive per-(setup, hour) ATR threshold from atr_filter_test
         # (only for setups with verdict=IMPROVES → these get the filter).
-        atr_rule_thresholds = {}  # (setup, hour) → threshold_pct
+        atr_rule_thresholds = {}  # (setup, hour) → (threshold_pct, filter_tier)
         for h_str, hd in atr_filter_result.get("by_hour", {}).items():
             h_int = int(h_str)
-            atr_lo = hd.get("atr_tertile_boundaries", [None, None])[0]
+            atr_tert = hd.get("atr_tertile_boundaries", [None, None])
+            atr_lo = atr_tert[0] if atr_tert else None
+            atr_hi = atr_tert[1] if atr_tert and len(atr_tert) > 1 else None
             if atr_lo is None: continue
             for s, sd in hd.get("setups", {}).items():
                 if sd.get("verdict") == "IMPROVES":
-                    atr_rule_thresholds[(s, h_int)] = atr_lo
+                    # v31: respect selected filter tier (mid_hi or hi)
+                    selected = sd.get("selected_filter", "mid_hi")
+                    if selected == "hi" and atr_hi is not None:
+                        atr_rule_thresholds[(s, h_int)] = (atr_hi, "hi")
+                    else:
+                        atr_rule_thresholds[(s, h_int)] = (atr_lo, "mid_hi")
 
         # Determine last 30 trading days present in event data
         all_dates = set()
@@ -4255,17 +4290,28 @@ def run_setup_evaluation(target_pct=0.01):
             for (s, active_hour) in live_active:
                 if active_hour != h: continue
                 ev_list = hr["events"].get(s, [])
-                atr_thresh = atr_rule_thresholds.get((s, h))
+                atr_info = atr_rule_thresholds.get((s, h))
                 for e in ev_list:
                     if e["date"] not in sim_dates: continue
                     day = per_day[e["date"]]
                     features = e.get("features") or {}
                     stock_atr = features.get("atr_pct")
-                    # Apply ATR filter rule if applicable
-                    if atr_thresh is not None:
-                        if stock_atr is None or stock_atr <= atr_thresh:
+                    # Apply ATR filter rule if applicable (v31: tier-aware)
+                    if atr_info is not None:
+                        thresh, tier = atr_info
+                        if stock_atr is None:
                             day["atr_filtered"] += 1
                             continue
+                        if tier == "hi":
+                            # hi: skip when below atr_hi
+                            if stock_atr < thresh:
+                                day["atr_filtered"] += 1
+                                continue
+                        else:
+                            # mid_hi: skip when <= atr_lo
+                            if stock_atr <= thresh:
+                                day["atr_filtered"] += 1
+                                continue
                     # Record firing
                     day["total"] += 1
                     day["by_hour"][h] += 1
@@ -6263,6 +6309,250 @@ def _build_price_path(after_bars, scan_price):
     return path
 
 
+# ═══════════════════════════════════════════════════════════════════
+# v32: REGIME-DECONTAMINATED MODEL
+# Trains LightGBM at +0.32% target with SPY-context features REMOVED
+# (spy_ret, spy_momentum, spy_vol — the three features that are identical
+# across all stocks at the same (date, hour)). Purpose: isolate whether the
+# model's edge is stock-specific signal or purely regime detection.
+#
+# If AUC drops from ~0.62 to near 0.50, the model was regime-based.
+# If AUC stays near 0.62, there's real stock-specific signal.
+#
+# Keeps spy-RELATIVE features (ret_vs_spy, mom_vs_spy) since those are
+# stock-specific measurements that happen to reference SPY.
+# ═══════════════════════════════════════════════════════════════════
+V32_RESULTS_PATH = DATA_DIR / "v32_regime_decontaminated.json"
+v32_in_progress = False
+v32_progress = {"phase":"idle","pct":0,"message":""}
+
+def run_v32_regime_decontaminated(target_pct=0.0032):
+    """Train +0.32% LightGBM with spy_ret, spy_momentum, spy_vol removed. Compare to v28 baseline."""
+    global v32_in_progress, v32_progress
+    if v32_in_progress:
+        log.warning("v32 already running"); return
+    v32_in_progress = True
+    v32_progress = {"phase":"starting","pct":0,"message":"Starting v32 regime-decontaminated model..."}
+
+    try:
+        if not (BARS_DAILY_CACHE.exists() and BARS_INTRADAY_CACHE.exists()):
+            raise RuntimeError("No bar cache. Run Training first.")
+
+        import numpy as _np
+        from sklearn.metrics import roc_auc_score as _auc
+
+        v32_progress = {"phase":"loading","pct":2,"message":"Loading bars..."}
+        daily_bars = pickle.loads(BARS_DAILY_CACHE.read_bytes())
+        intraday_bars = pickle.loads(BARS_INTRADAY_CACHE.read_bytes())
+
+        iwm_daily = daily_bars.get("IWM", [])
+        if len(iwm_daily) < 200:
+            raise RuntimeError("Insufficient IWM history")
+        all_dates_list = sorted(set(b["t"][:10] for b in iwm_daily))
+        n_dates = len(all_dates_list)
+        split_tr = int(n_dates * 0.60)
+        split_va = int(n_dates * 0.80)
+        train_dates = set(all_dates_list[:split_tr])
+        val_dates = set(all_dates_list[split_tr:split_va])
+        test_dates = set(all_dates_list[split_va:])
+
+        def bars_for_date(ticker, date):
+            return [b for b in intraday_bars.get(ticker, []) if b["t"][:10] == date]
+        def daily_up_to(ticker, date):
+            return [b for b in daily_bars.get(ticker, []) if b["t"][:10] < date]
+
+        # v32: exclude pure SPY-context features
+        EXCLUDED_FEATURES = {"spy_ret", "spy_momentum", "spy_vol"}
+        base_feat_names_filtered = [f for f in FEATURE_NAMES if f not in EXCLUDED_FEATURES]
+        setup_feat_names = [f"setup_{s}" for s in SETUP_NAMES]
+        all_feat_names = base_feat_names_filtered + setup_feat_names + ["hour_11","hour_12","hour_13","hour_14","hour_15"]
+        log.info(f"v32: dropped {len(FEATURE_NAMES)-len(base_feat_names_filtered)} SPY-context features. Using {len(all_feat_names)} features total (v28 used {len(FEATURE_NAMES)+len(setup_feat_names)+5}).")
+
+        tickers_list = [t for t in TICKERS if t not in ("SPY", "IWM")]
+
+        v32_progress = {"phase":"features","pct":5,"message":"Building features..."}
+        all_rows = []
+
+        for di, date in enumerate(all_dates_list):
+            if (di + 1) % 10 == 0:
+                pct = 5 + int((di / n_dates) * 65)
+                v32_progress = {"phase":"features","pct":pct,
+                    "message":f"Building features for date {di+1}/{n_dates}..."}
+            fold = "train" if date in train_dates else ("val" if date in val_dates else "test")
+
+            spy_intraday_date = [b for b in intraday_bars.get("SPY", []) if b["t"][:10] == date]
+            iwm_intraday_date = [b for b in intraday_bars.get("IWM", []) if b["t"][:10] == date]
+
+            for scan_hour in SCAN_HOURS:
+                scan_minute_et = scan_hour * 60
+                spy_before = [b for b in spy_intraday_date if (bar_to_et_minutes(b) or -1) < scan_minute_et]
+                iwm_before = [b for b in iwm_intraday_date if (bar_to_et_minutes(b) or -1) < scan_minute_et]
+                # Still compute spy_ctx — it feeds compute_features which may use it
+                # for ret_vs_spy/mom_vs_spy/sector calcs. We only exclude the 3 at vector-build time.
+                spy_ctx = compute_spy_context(spy_before) if spy_before else None
+
+                sector_green_count = defaultdict(lambda: [0, 0])
+                cache_per_tkr = {}
+                for tkr in tickers_list:
+                    tbars = bars_for_date(tkr, date)
+                    if len(tbars) < 6: continue
+                    tb = [b for b in tbars if (bar_to_et_minutes(b) or -1) < scan_minute_et]
+                    ta = [b for b in tbars if (bar_to_et_minutes(b) or -1) >= scan_minute_et]
+                    if len(tb) < 6 or len(ta) < 2: continue
+                    dl = daily_up_to(tkr, date)
+                    pc = dl[-1]["c"] if dl else None
+                    if pc is None: continue
+                    sp = tb[-1]["c"]
+                    sec = SECTORS.get(tkr, "?")
+                    sector_green_count[sec][1] += 1
+                    if sp > pc: sector_green_count[sec][0] += 1
+                    cache_per_tkr[tkr] = (tb, ta, sp, pc, dl, sec)
+
+                date_hour_rows = []
+                for ticker, (before, after, scan_price, prev_close, dl, sec) in cache_per_tkr.items():
+                    open_price = before[0]["o"]
+                    feat = compute_features(before, dl, scan_price, open_price, scan_hour,
+                                            spy_context=spy_ctx, prev_close=prev_close)
+                    if feat is None: continue
+                    sgc = sector_green_count[sec]
+                    breadth = sgc[0] / sgc[1] if sgc[1] > 0 else 0
+                    active = detect_setups(before, scan_price, prev_close,
+                                           sector_breadth=breadth, prior_daily=dl,
+                                           iwm_bars=iwm_before, scan_minute_et=scan_minute_et)
+                    setup_flags = {f"setup_{s}": int(bool(active[s])) for s in SETUP_NAMES}
+
+                    hit, _ = did_hit_target(scan_price, after[1:], target_pct=target_pct)
+
+                    date_hour_rows.append({
+                        "feat": feat, "setup_flags": setup_flags, "sector": sec,
+                        "label": 1 if hit else 0, "hour": scan_hour,
+                    })
+
+                if len(date_hour_rows) < 10: continue
+                feats_list = [r["feat"] for r in date_hour_rows]
+                sectors_list = [r["sector"] for r in date_hour_rows]
+                add_ranks(feats_list)
+                add_sector_relative(feats_list, sectors_list)
+
+                for r in date_hour_rows:
+                    # v32: build vector SKIPPING the 3 excluded SPY-context features
+                    vec = [float(r["feat"].get(k, 0.0) or 0.0) for k in base_feat_names_filtered]
+                    vec += [float(r["setup_flags"].get(k, 0)) for k in setup_feat_names]
+                    vec += [1.0 if r["hour"] == h else 0.0 for h in [11,12,13,14,15]]
+                    all_rows.append({"vec": vec, "label": r["label"], "fold": fold})
+
+        log.info(f"v32: built {len(all_rows)} rows")
+        if len(all_rows) < 1000:
+            raise RuntimeError(f"Insufficient examples: {len(all_rows)}")
+
+        v32_progress = {"phase":"vectorize","pct":72,"message":"Building matrices..."}
+        train_rows = [r for r in all_rows if r["fold"] == "train"]
+        val_rows = [r for r in all_rows if r["fold"] == "val"]
+        test_rows = [r for r in all_rows if r["fold"] == "test"]
+        X_train = _np.array([r["vec"] for r in train_rows], dtype=_np.float32)
+        X_val = _np.array([r["vec"] for r in val_rows], dtype=_np.float32)
+        X_test = _np.array([r["vec"] for r in test_rows], dtype=_np.float32)
+        y_train = _np.array([r["label"] for r in train_rows], dtype=_np.int32)
+        y_val = _np.array([r["label"] for r in val_rows], dtype=_np.int32)
+        y_test = _np.array([r["label"] for r in test_rows], dtype=_np.int32)
+
+        v32_progress = {"phase":"training","pct":80,"message":"Training LightGBM (decontaminated)..."}
+        lgbm_params = {
+            "objective": "binary", "metric": "binary_logloss",
+            "learning_rate": 0.05, "num_leaves": 31, "min_data_in_leaf": 50,
+            "feature_fraction": 0.9, "bagging_fraction": 0.85, "bagging_freq": 5,
+            "lambda_l2": 1.0, "verbose": -1,
+        }
+        train_ds = lgb.Dataset(X_train, label=y_train, feature_name=all_feat_names)
+        val_ds = lgb.Dataset(X_val, label=y_val, feature_name=all_feat_names, reference=train_ds)
+        model = lgb.train(lgbm_params, train_ds, num_boost_round=500,
+                          valid_sets=[val_ds], valid_names=["val"],
+                          callbacks=[lgb.early_stopping(30), lgb.log_evaluation(0)])
+
+        raw_val = model.predict(X_val, num_iteration=model.best_iteration)
+        calibrator = IsotonicRegression(out_of_bounds="clip")
+        calibrator.fit(raw_val, y_val)
+        raw_test = model.predict(X_test, num_iteration=model.best_iteration)
+        calib_test = calibrator.transform(raw_test)
+        try:
+            auc_test = round(_auc(y_test, raw_test), 4)
+        except Exception:
+            auc_test = None
+
+        buckets_def = [
+            (0.0, 0.3, "0.0-0.3"), (0.3, 0.4, "0.3-0.4"), (0.4, 0.5, "0.4-0.5"),
+            (0.5, 0.6, "0.5-0.6"), (0.6, 0.7, "0.6-0.7"), (0.7, 0.8, "0.7-0.8"),
+            (0.8, 0.9, "0.8-0.9"), (0.9, 1.01, "0.9+"),
+        ]
+        bucket_stats = []
+        for lo, hi, lbl in buckets_def:
+            mask = (calib_test >= lo) & (calib_test < hi)
+            n = int(mask.sum())
+            if n == 0:
+                bucket_stats.append({"bucket": lbl, "n": 0, "n_hits": 0,
+                    "hit_rate_pct": None, "ci_lower_pct": None, "ci_upper_pct": None,
+                    "mean_predicted_prob": None})
+                continue
+            hits = int(y_test[mask].sum())
+            lower, upper = wilson_ci(hits, n)
+            bucket_stats.append({
+                "bucket": lbl, "n": n, "n_hits": hits,
+                "hit_rate_pct": round(hits / n * 100, 2),
+                "ci_lower_pct": round(lower * 100, 2),
+                "ci_upper_pct": round(upper * 100, 2),
+                "mean_predicted_prob": round(float(calib_test[mask].mean()), 3),
+            })
+
+        pass_buckets = [b for b in bucket_stats
+                        if b["bucket"] in ("0.8-0.9", "0.9+")
+                        and b["n"] and b["n"] >= 30
+                        and b["ci_lower_pct"] is not None and b["ci_lower_pct"] >= 75]
+        verdict = "ACHIEVES_80_HIGH_CONFIDENCE" if pass_buckets else "DOES_NOT_ACHIEVE_80"
+
+        imp_raw = model.feature_importance(importance_type="gain")
+        feat_imp = sorted([(n, float(v)) for n, v in zip(all_feat_names, imp_raw)],
+                          key=lambda x: -x[1])
+        total_imp = sum(v for _, v in feat_imp) or 1
+        feat_imp_pct = [(n, round(v / total_imp * 100, 2)) for n, v in feat_imp]
+
+        # Compare to v28 baseline (+0.30% with SPY features)
+        # v28 was: AUC 0.6179, 0.9+ bucket n=138, hit 86.96%
+        # Note: v32 uses +0.32% target to match v29's highest-passing target, not v28's 0.30%.
+        # So direct comparison requires caveat.
+
+        results = {
+            "generated_at": datetime.now(ET).isoformat(),
+            "target_pct": target_pct,
+            "target_label": f"{target_pct*100:.2f}%",
+            "excluded_features": sorted(list(EXCLUDED_FEATURES)),
+            "n_features": len(all_feat_names),
+            "v28_baseline_note": "v28 +0.30% with SPY-context features: AUC 0.6179, 0.9+ bucket n=138 hit 86.96% (passed strict). v29 +0.32% with SPY-context: AUC 0.6203, 0.9+ bucket n=124 hit 83.87% (passed strict).",
+            "fold_sizes": {"train": len(X_train), "val": len(X_val), "test": len(X_test)},
+            "base_rates": {
+                "train": round(float(y_train.mean()) * 100, 2),
+                "val": round(float(y_val.mean()) * 100, 2),
+                "test": round(float(y_test.mean()) * 100, 2),
+            },
+            "auc_test": auc_test,
+            "buckets": bucket_stats,
+            "verdict": verdict,
+            "top_features": feat_imp_pct[:20],
+            "best_iteration": model.best_iteration,
+        }
+        V32_RESULTS_PATH.write_text(json.dumps(results, indent=2, default=str))
+
+        log.info(f"v32 complete. AUC={auc_test}, verdict={verdict}")
+        v32_progress = {"phase":"done","pct":100,
+            "message":f"Done. AUC={auc_test}. Verdict: {verdict}"}
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        log.error(f"v32 failed: {e}\n{tb}", exc_info=True)
+        v32_progress = {"phase":"error","pct":0,"message":str(e)}
+    finally:
+        v32_in_progress = False
+
+
 # Evidence-quality thresholds for declaring a setup tradable at a given hour.
 # A setup is "active" only at scan hours where it survived test-fold evaluation.
 # These thresholds are deliberately conservative.
@@ -6350,28 +6640,44 @@ def derive_breadth_rule(regime_data):
         }
     return None
 
-def derive_atr_filter_rule(atr_test_data, atr_lo_threshold):
+def derive_atr_filter_rule(atr_test_data, atr_lo_threshold, atr_hi_threshold=None):
     """v21: Derive an ATR filter rule for a setup from the atr_filter_test results.
-    Returns a rule dict if the setup's mid_hi verdict is IMPROVES, else None.
+    Returns a rule dict if the setup's verdict is IMPROVES, else None.
 
-    Rule: skip matches where stock's ATR% is below atr_lo_threshold.
+    v31: now respects selected_filter field (mid_hi OR hi). When hi is selected,
+    uses the stricter atr_hi_threshold rather than atr_lo_threshold.
     """
     if not atr_test_data: return None
     verdict = atr_test_data.get("verdict")
     if verdict != "IMPROVES": return None
-    # Extract edge deltas for confidence
-    mid_hi = atr_test_data.get("mid_hi", {})
+
+    selected = atr_test_data.get("selected_filter", "mid_hi")
+    filt = atr_test_data.get(selected, {})
+
+    # When hi filter selected, use atr_hi_threshold; when mid_hi, use atr_lo_threshold
+    # For hi filter: skip when ATR% < atr_hi (keep only top tertile)
+    # For mid_hi filter: skip when ATR% <= atr_lo (keep middle + high tertiles)
+    if selected == "hi":
+        threshold = atr_hi_threshold
+        action = "filter_when_below_hi_atr"
+        desc_op = "<"
+    else:
+        threshold = atr_lo_threshold
+        action = "filter_when_low_atr"
+        desc_op = "<="
+
     return {
-        "action": "filter_when_low_atr",
-        "atr_threshold_pct": atr_lo_threshold,
+        "action": action,
+        "atr_threshold_pct": threshold,
+        "filter_tier": selected,  # v31: explicit filter tier
         "verdict": verdict,
-        "edge_delta_disc": mid_hi.get("edge_delta_disc"),
-        "edge_delta_val": mid_hi.get("edge_delta_val"),
-        "volume_reduction_pct": mid_hi.get("firing_volume_change_pct"),
-        "description": (f"Skip when stock ATR% < {atr_lo_threshold:.2f}%. "
-                        f"Historical edge improvement: +{mid_hi.get('edge_delta_disc')}pp (disc), "
-                        f"+{mid_hi.get('edge_delta_val')}pp (val). "
-                        f"Volume change: {mid_hi.get('firing_volume_change_pct')}%."),
+        "edge_delta_disc": filt.get("edge_delta_disc"),
+        "edge_delta_val": filt.get("edge_delta_val"),
+        "volume_reduction_pct": filt.get("firing_volume_change_pct"),
+        "description": (f"Skip when stock ATR% {desc_op} {threshold:.2f}% (filter tier: {selected}). "
+                        f"Historical edge improvement: +{filt.get('edge_delta_disc')}pp (disc), "
+                        f"+{filt.get('edge_delta_val')}pp (val). "
+                        f"Volume change: {filt.get('firing_volume_change_pct')}%."),
     }
 
 def load_active_setups_for_scanner():
@@ -6432,11 +6738,13 @@ def load_active_setups_for_scanner():
             setup_regimes = hour_regimes.get(setup_name, {})
             breadth_rule = derive_breadth_rule(setup_regimes.get("breadth", {}))
             # v21: derive ATR filter rule from atr_filter_test results
+            # v31: also extract atr_hi_threshold for use when `hi` filter selected
             atr_test_hour = data.get("atr_filter_test", {}).get("by_hour", {}).get(h_str, {})
             atr_tert = atr_test_hour.get("atr_tertile_boundaries", [None, None])
             atr_lo_threshold = atr_tert[0] if atr_tert else None
+            atr_hi_threshold = atr_tert[1] if atr_tert and len(atr_tert) > 1 else None
             atr_test_setup = atr_test_hour.get("setups", {}).get(setup_name)
-            atr_rule = (derive_atr_filter_rule(atr_test_setup, atr_lo_threshold)
+            atr_rule = (derive_atr_filter_rule(atr_test_setup, atr_lo_threshold, atr_hi_threshold)
                         if (atr_test_setup and atr_lo_threshold is not None) else None)
             hour_active.append({
                 "name": setup_name,
@@ -6745,13 +7053,24 @@ def run_live_scan(scan_hour):
                         matched.append(match_meta)
                         continue
                 # v21: apply ATR filter rule (setup-specific filter for low-ATR stocks).
-                # Currently active only for rel_strength_iwm (verdict=IMPROVES on mid_hi).
+                # v31: now handles BOTH mid_hi (filter_when_low_atr) AND hi (filter_when_below_hi_atr).
                 atr_rule = base_meta.get("atr_filter_rule")
-                if atr_rule and atr_rule.get("action") == "filter_when_low_atr":
+                if atr_rule:
+                    action = atr_rule.get("action")
                     threshold = atr_rule.get("atr_threshold_pct")
-                    if threshold is not None and stock_atr_pct > 0 and stock_atr_pct <= threshold:
-                        filtered.append({**base_meta, "filter_reason": f"ATR filter: stock ATR% {stock_atr_pct:.2f}% ≤ threshold {threshold:.2f}%"})
-                        continue
+                    tier = atr_rule.get("filter_tier", "mid_hi")
+                    if action == "filter_when_low_atr":
+                        # mid_hi: skip when stock ATR% <= threshold (drops bottom tertile)
+                        if threshold is not None and stock_atr_pct > 0 and stock_atr_pct <= threshold:
+                            filtered.append({**base_meta,
+                                "filter_reason": f"ATR filter ({tier}): stock ATR% {stock_atr_pct:.2f}% ≤ threshold {threshold:.2f}%"})
+                            continue
+                    elif action == "filter_when_below_hi_atr":
+                        # hi: skip when stock ATR% < threshold (keeps only top tertile)
+                        if threshold is not None and stock_atr_pct > 0 and stock_atr_pct < threshold:
+                            filtered.append({**base_meta,
+                                "filter_reason": f"ATR filter ({tier}): stock ATR% {stock_atr_pct:.2f}% < threshold {threshold:.2f}%"})
+                            continue
                 matched.append(base_meta)
             if matched:
                 per_stock_setup_matches[ticker] = matched
@@ -7376,6 +7695,33 @@ def v30_results_endpoint():
         return json.loads(V30_RESULTS_PATH.read_text())
     except Exception as e:
         return JSONResponse({"error":str(e)},500)
+
+# v32: regime-decontaminated model endpoints
+@app.post("/api/v32/train")
+def trigger_v32(bg: BackgroundTasks):
+    if v32_in_progress: return {"status":"already_running"}
+    if (training_in_progress or setup_eval_in_progress or
+        conviction_train_in_progress or pattern_discovery_in_progress or
+        v28_in_progress or v29_in_progress or v30_in_progress):
+        return JSONResponse({"error":"Another task running"},400)
+    if not (BARS_DAILY_CACHE.exists() and BARS_INTRADAY_CACHE.exists()):
+        return JSONResponse({"error":"Bar cache missing"},400)
+    bg.add_task(run_v32_regime_decontaminated)
+    return {"status":"started"}
+
+@app.get("/api/v32/progress")
+def v32_progress_endpoint():
+    return {"inProgress":v32_in_progress, **v32_progress}
+
+@app.get("/api/v32/results")
+def v32_results_endpoint():
+    if not V32_RESULTS_PATH.exists():
+        return {"status":"no_results"}
+    try:
+        return json.loads(V32_RESULTS_PATH.read_text())
+    except Exception as e:
+        return JSONResponse({"error":str(e)},500)
+
 
 
 

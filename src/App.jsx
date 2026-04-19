@@ -588,6 +588,21 @@ function TrainingTab() {
     return ()=>clearInterval(iv);
   },[pollV30]);
 
+  // v32: regime-decontaminated model state
+  const [v32Prog, setV32Prog] = useState(null);
+  const [v32Results, setV32Results] = useState(null);
+  const pollV32 = useCallback(()=>{
+    fetch('/api/v32/progress').then(r=>r.json()).then(setV32Prog).catch(()=>{});
+    fetch('/api/v32/results').then(r=>r.json()).then(d=>{
+      if (d && !d.status) setV32Results(d);
+    }).catch(()=>{});
+  },[]);
+  useEffect(()=>{
+    pollV32();
+    const iv=setInterval(pollV32, 3000);
+    return ()=>clearInterval(iv);
+  },[pollV32]);
+
   const trigTrain=async()=>{
     await fetch('/api/train',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({tp_mult:tp,sl_mult:sl})});
@@ -647,6 +662,13 @@ function TrainingTab() {
     const d=await r.json();
     if(d.error) alert(`Error: ${d.error}`);
     pollV30();
+  };
+  const runV32=async()=>{
+    if(!confirm("Run v32 regime-decontaminated model? Trains LightGBM at +0.32% target WITHOUT the three pure SPY-context features (spy_ret, spy_momentum, spy_vol). Tests whether the 0.9+ bucket signal survives when regime detection is stripped away. Takes ~15-20 minutes.")) return;
+    const r=await fetch('/api/v32/train',{method:'POST'});
+    const d=await r.json();
+    if(d.error) alert(`Error: ${d.error}`);
+    pollV32();
   };
 
   if(ld) return <div style={{color:"#475569",padding:40,textAlign:"center"}}>Loading...</div>;
@@ -1504,6 +1526,116 @@ function TrainingTab() {
                 Exported: top {v30Results.confident_winners?.length} winners + top {v30Results.confident_losers?.length} losers (ranked by model probability). Click Download JSON to share the full data.
               </div>
             </div>
+          </div>
+        )}
+      </Box>
+
+      {/* v32: REGIME-DECONTAMINATED MODEL */}
+      <Box>
+        <Lbl>Regime-Decontaminated Model (v32) — isolate stock-specific signal from SPY-context signal</Lbl>
+        <div style={{fontSize:10,color:"#475569",marginBottom:10,lineHeight:1.5}}>
+          v28/v29 found that confident predictions cluster on specific market-regime days — the model may be picking <i>days</i>, not <i>stocks</i>. This retrains LightGBM at +0.32% with three pure SPY-context features REMOVED (spy_ret, spy_momentum, spy_vol — features that are identical for every stock scanned at the same time). Keeps spy-RELATIVE features (ret_vs_spy, mom_vs_spy) since those are stock-specific. <b>If AUC stays near 0.62 and 0.9+ bucket still passes strict: real stock-specific signal exists. If AUC drops toward 0.50 and the 0.9+ bucket empties or fails: the model was purely regime detection.</b>
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:10}}>
+          <Btn onClick={runV32} disabled={v32Prog?.inProgress||ip||extProg?.inProgress||repairProg?.inProgress||convProg?.inProgress||patProg?.inProgress||v28Prog?.inProgress||v29Prog?.inProgress||v30Prog?.inProgress} color="#0ea5e9" style={{padding:"8px 16px",fontSize:12}}>
+            {v32Prog?.inProgress?"Running...":"Run v32 Decontaminated Model"}
+          </Btn>
+          {v32Results && !v32Prog?.inProgress && (
+            <>
+              <Btn onClick={()=>downloadJson(v32Results,`v32_regime_decontaminated_${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.json`)} color="#06b6d4" style={{padding:"8px 12px",fontSize:12}}>
+                Download JSON
+              </Btn>
+              <span style={{fontSize:11,color:"#64748b"}}>
+                Last run: {v32Results.generated_at?.slice(0,19).replace("T"," ")}
+              </span>
+            </>
+          )}
+        </div>
+        {v32Prog?.inProgress && (
+          <div style={{marginTop:10,marginBottom:10}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+              <div style={{flex:1,height:6,background:"rgba(255,255,255,0.06)",borderRadius:3,overflow:"hidden"}}>
+                <div style={{width:`${v32Prog.pct||0}%`,height:"100%",background:"#0ea5e9",borderRadius:3,transition:"width 0.5s"}}/>
+              </div>
+              <span style={{fontSize:11,color:"#0ea5e9",fontWeight:600}}>{v32Prog.pct||0}%</span>
+            </div>
+            <div style={{fontSize:11,color:"#64748b"}}>{v32Prog.message}</div>
+          </div>
+        )}
+        {!v32Prog?.inProgress && v32Prog?.phase === "error" && (
+          <div style={{marginTop:10,padding:"6px 10px",borderRadius:4,background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.2)"}}>
+            <div style={{fontSize:11,color:"#fca5a5",fontWeight:600}}>✗ {v32Prog.message}</div>
+          </div>
+        )}
+        {v32Results && (
+          <div style={{marginTop:14}}>
+            <div style={{marginBottom:12,padding:"8px 12px",borderRadius:4,
+              background:v32Results.verdict==="ACHIEVES_80_HIGH_CONFIDENCE"?"rgba(34,197,94,0.08)":"rgba(234,179,8,0.08)",
+              border:`1px solid ${v32Results.verdict==="ACHIEVES_80_HIGH_CONFIDENCE"?"rgba(34,197,94,0.25)":"rgba(234,179,8,0.25)"}`}}>
+              <div style={{display:"flex",flexWrap:"wrap",gap:12,alignItems:"center"}}>
+                <span style={{fontSize:10,color:"#64748b",fontWeight:600,textTransform:"uppercase",letterSpacing:0.3}}>Verdict</span>
+                <span style={{color:v32Results.verdict==="ACHIEVES_80_HIGH_CONFIDENCE"?"#22c55e":"#eab308",fontWeight:700}}>{v32Results.verdict}</span>
+                <span style={{color:"#94a3b8",fontSize:11}}>
+                  AUC test: <b>{v32Results.auc_test}</b> (v28 baseline with SPY context was 0.6179 at +0.30%, v29 was 0.6203 at +0.32%)
+                </span>
+              </div>
+              <div style={{fontSize:10,color:"#64748b",marginTop:4}}>
+                Dropped features: {(v32Results.excluded_features||[]).join(", ")} · n_features now {v32Results.n_features} · base rate (test): {v32Results.base_rates?.test}%
+              </div>
+            </div>
+
+            {/* Calibration table */}
+            <div style={{fontSize:10,color:"#94a3b8",fontWeight:600,textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>Calibration buckets (test fold)</div>
+            <table style={{width:"100%",fontSize:11,borderCollapse:"collapse",marginBottom:14}}>
+              <thead><tr>
+                {["Bucket","n","Hit%","CI 95%","Mean Pred","Status"].map(col=>
+                  <th key={col} style={{padding:"3px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase"}}>{col}</th>)}
+              </tr></thead>
+              <tbody>
+                {(v32Results.buckets||[]).map((b,bi)=>{
+                  const isHigh = b.bucket==="0.8-0.9" || b.bucket==="0.9+";
+                  const bPass = isHigh && b.n>=30 && b.ci_lower_pct!=null && b.ci_lower_pct>=75;
+                  const hr = b.hit_rate_pct;
+                  const hrColor = hr==null?"#64748b":hr>=75?"#22c55e":hr>=60?"#a3e635":hr>=50?"#eab308":hr>=40?"#94a3b8":"#ef4444";
+                  return <tr key={bi} style={{borderTop:"1px solid rgba(255,255,255,0.04)",background:isHigh?"rgba(14,165,233,0.06)":"transparent"}}>
+                    <td style={{padding:"4px 8px",color:isHigh?"#7dd3fc":"#e2e8f0",fontWeight:isHigh?600:400}}>{b.bucket}</td>
+                    <td style={{padding:"4px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{b.n}</td>
+                    <td style={{padding:"4px 8px",color:hrColor,fontVariantNumeric:"tabular-nums",fontWeight:600}}>{hr!=null?`${hr}%`:"—"}</td>
+                    <td style={{padding:"4px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums",fontSize:10}}>{b.ci_lower_pct!=null?`[${b.ci_lower_pct}%, ${b.ci_upper_pct}%]`:"—"}</td>
+                    <td style={{padding:"4px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{b.mean_predicted_prob!=null?`${(b.mean_predicted_prob*100).toFixed(1)}%`:"—"}</td>
+                    <td style={{padding:"4px 8px",fontSize:10,fontWeight:700,letterSpacing:0.3,color:bPass?"#22c55e":(isHigh && b.n>0?"#eab308":"#64748b")}}>
+                      {bPass?"✓ PASSES":(isHigh && b.n>0?"✗ below":"")}
+                    </td>
+                  </tr>;
+                })}
+              </tbody>
+            </table>
+
+            {/* Top features */}
+            <details>
+              <summary style={{cursor:"pointer",fontSize:11,color:"#94a3b8",fontWeight:600,textTransform:"uppercase",letterSpacing:0.3}}>Top 20 feature importances (click to expand)</summary>
+              <table style={{width:"100%",fontSize:11,borderCollapse:"collapse",marginTop:6}}>
+                <thead><tr>
+                  {["Feature","Importance %"].map(col=>
+                    <th key={col} style={{padding:"3px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase"}}>{col}</th>)}
+                </tr></thead>
+                <tbody>
+                  {(v32Results.top_features||[]).map(([name,pct],fi)=>
+                    <tr key={fi} style={{borderTop:"1px solid rgba(255,255,255,0.03)"}}>
+                      <td style={{padding:"3px 8px",color:"#e2e8f0"}}>{name}</td>
+                      <td style={{padding:"3px 8px",color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>
+                        <div style={{display:"flex",alignItems:"center",gap:6}}>
+                          <div style={{width:100,height:5,background:"rgba(255,255,255,0.05)",borderRadius:2,overflow:"hidden"}}>
+                            <div style={{width:`${Math.min(100,pct*2)}%`,height:"100%",background:"#0ea5e9"}}/>
+                          </div>
+                          <span>{pct}%</span>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </details>
           </div>
         )}
       </Box>
