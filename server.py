@@ -7272,6 +7272,27 @@ def run_live_scan(scan_hour):
     results.sort(key=lambda x: x["winProb"], reverse=True)
     for i,r in enumerate(results): r["rank"] = i+1
 
+    # v33.1: per-hour rank + percentile based on v33 conviction (independent of winProb rank).
+    # Addresses the regime-scaling issue: absolute prob shifts across scan hours,
+    # so "top 5% within this hour" is a more stable signal than fixed 80% threshold.
+    rows_with_v33 = [r for r in results if r.get("convictionV33Prob") is not None]
+    if rows_with_v33:
+        sorted_by_v33 = sorted(rows_with_v33, key=lambda x: -x["convictionV33Prob"])
+        n_with_v33 = len(sorted_by_v33)
+        for rank_idx, r in enumerate(sorted_by_v33):
+            r["v33Rank"] = rank_idx + 1  # 1-based rank within this hour
+            # Percentile: what fraction of stocks score STRICTLY LOWER than this one
+            # e.g., rank 1 → percentile ~1.0 (top); rank n → percentile ~0.0
+            r["v33Percentile"] = round((n_with_v33 - rank_idx - 1) / max(n_with_v33 - 1, 1), 4)
+        for r in results:
+            if r.get("convictionV33Prob") is None:
+                r["v33Rank"] = None
+                r["v33Percentile"] = None
+    else:
+        for r in results:
+            r["v33Rank"] = None
+            r["v33Percentile"] = None
+
     # Mark tradable = top-1 AND clears threshold
     # Strategy is binary: top pick must meet or exceed threshold, else no trade.
     for r in results:
@@ -7298,6 +7319,22 @@ def run_live_scan(scan_hour):
     n_conv_90 = sum(1 for r in results if r.get("convictionV33Prob") is not None and r["convictionV33Prob"] >= 0.9)
     n_conv_80 = sum(1 for r in results if r.get("convictionV33Prob") is not None and r["convictionV33Prob"] >= 0.8)
     v33_available = v33_deploy_model is not None and v33_deploy_meta is not None
+
+    # v33.1: distribution stats within this scan hour — lets UI/downstream spot
+    # when the regime has pulled the whole distribution up/down vs. historical.
+    v33_probs_list = [r["convictionV33Prob"] for r in results if r.get("convictionV33Prob") is not None]
+    v33_dist = None
+    if v33_probs_list:
+        v33_probs_sorted = sorted(v33_probs_list, reverse=True)
+        v33_dist = {
+            "n": len(v33_probs_sorted),
+            "max": round(v33_probs_sorted[0], 4),
+            "p95": round(v33_probs_sorted[max(0, int(len(v33_probs_sorted) * 0.05) - 1)], 4),
+            "p90": round(v33_probs_sorted[max(0, int(len(v33_probs_sorted) * 0.10) - 1)], 4),
+            "median": round(v33_probs_sorted[len(v33_probs_sorted) // 2], 4),
+            "min": round(v33_probs_sorted[-1], 4),
+            "mean": round(float(np.mean(v33_probs_list)), 4),
+        }
 
     scan_result = {
         "data":results,"timestamp":datetime.now(ET).isoformat(),"source":"live",
@@ -7327,6 +7364,8 @@ def run_live_scan(scan_hour):
         "v33Target": v33_deploy_meta.get("target_label") if v33_deploy_meta else None,
         "v33HighConv90Count": n_conv_90,
         "v33HighConv80Count": n_conv_80,
+        # v33.1: distribution stats for this hour's v33 predictions
+        "v33Distribution": v33_dist,
     }
 
     # v10/v13: persist each setup firing to SETUP_FIRING_LOG for live-validation tracking.
@@ -7945,11 +7984,13 @@ def diagnostic():
 
     scans = {}
     for h_str, scan in last_scans.items():
-        scans[h_str] = {
-            "timestamp":scan.get("timestamp"),"source":scan.get("source"),
-            "scoreRange":scan.get("scoreRange"),
-            "top20":(scan.get("data") or [])[:20]
-        }
+        # v33.1: preserve ALL top-level scan metadata — previously we only copied
+        # timestamp/source/scoreRange/top20 which stripped v33 counts, breadth, setups.
+        # Now copy every non-bulky field; full data array trimmed to top20 to keep
+        # diagnostic size manageable.
+        scans[h_str] = {k: v for k, v in scan.items() if k != "data"}
+        # Add trimmed top20 view of data (sorted by winProb desc as in the scan)
+        scans[h_str]["top20"] = (scan.get("data") or [])[:20]
 
     return JSONResponse({
         "_type":"r2k_scanner_diagnostic","_version":"5.0_r2k_first_passage",

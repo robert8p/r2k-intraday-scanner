@@ -141,6 +141,8 @@ function ScannerTab({data,scanHour,source,elapsed,message,modelWR10,modelPnL10,h
     : mode==="posEV" ? data.filter(s=>s.ev>0)
     : mode==="conv90" ? [...data].filter(s=>s.convictionV33Prob != null && s.convictionV33Prob >= 0.9).sort((a,b)=>b.convictionV33Prob-a.convictionV33Prob)
     : mode==="conv80" ? [...data].filter(s=>s.convictionV33Prob != null && s.convictionV33Prob >= 0.8).sort((a,b)=>b.convictionV33Prob-a.convictionV33Prob)
+    : mode==="convTop5" ? [...data].filter(s=>s.v33Percentile != null && s.v33Percentile >= 0.95).sort((a,b)=>b.convictionV33Prob-a.convictionV33Prob)
+    : mode==="convTop10" ? [...data].filter(s=>s.v33Percentile != null && s.v33Percentile >= 0.90).sort((a,b)=>b.convictionV33Prob-a.convictionV33Prob)
     : data.slice(0, mode==="top10"?10:20);
   const posEV = data.filter(s=>s.ev>0);
   const tradable = data.filter(s=>s.tradable);
@@ -148,7 +150,10 @@ function ScannerTab({data,scanHour,source,elapsed,message,modelWR10,modelPnL10,h
   const highConv = data.filter(s=>convictionScore(s.setupMatches) >= 2);
   const highConv90 = data.filter(s=>s.convictionV33Prob != null && s.convictionV33Prob >= 0.9);
   const highConv80 = data.filter(s=>s.convictionV33Prob != null && s.convictionV33Prob >= 0.8);
+  const convTop5 = data.filter(s=>s.v33Percentile != null && s.v33Percentile >= 0.95);
+  const convTop10 = data.filter(s=>s.v33Percentile != null && s.v33Percentile >= 0.90);
   const v33Available = scanInfo?.v33Available;
+  const v33Dist = scanInfo?.v33Distribution;
   const avgEV = posEV.length>0 ? posEV.reduce((s,r)=>s+r.ev,0)/posEV.length : 0;
 
   return (
@@ -174,29 +179,43 @@ function ScannerTab({data,scanHour,source,elapsed,message,modelWR10,modelPnL10,h
         } else {
           bg = "rgba(100,116,139,0.04)"; border = "rgba(100,116,139,0.15)"; col = "#64748b";
           lbl = "NO HIGH-CONVICTION SIGNALS";
-          msg = `Regime not favorable for +${target} LightGBM model today. Setup-based scanner still active below.`;
+          msg = `Regime not favorable for +${target} model today. Use Top-5% or Top-10% filter for relative-best picks, or the setup-based scanner below.`;
         }
         return (
-          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12,padding:"8px 12px",borderRadius:4,background:bg,border:`1px solid ${border}`}}>
-            <span style={{fontSize:10,color:col,fontWeight:700,letterSpacing:0.5,textTransform:"uppercase",padding:"2px 6px",background:`${col}18`,borderRadius:2}}>{lbl}</span>
-            <span style={{fontSize:11,color:"#94a3b8"}}>{msg}</span>
+          <div style={{marginBottom:12,padding:"8px 12px",borderRadius:4,background:bg,border:`1px solid ${border}`}}>
+            <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+              <span style={{fontSize:10,color:col,fontWeight:700,letterSpacing:0.5,textTransform:"uppercase",padding:"2px 6px",background:`${col}18`,borderRadius:2}}>{lbl}</span>
+              <span style={{fontSize:11,color:"#94a3b8"}}>{msg}</span>
+            </div>
+            {v33Dist && (
+              <div style={{fontSize:10,color:"#64748b",marginTop:4,fontVariantNumeric:"tabular-nums"}}>
+                Distribution (n={v33Dist.n}): max <b style={{color:"#e2e8f0"}}>{(v33Dist.max*100).toFixed(1)}%</b> · p95 {(v33Dist.p95*100).toFixed(1)}% · p90 {(v33Dist.p90*100).toFixed(1)}% · median {(v33Dist.median*100).toFixed(1)}% · mean {(v33Dist.mean*100).toFixed(1)}% · min {(v33Dist.min*100).toFixed(1)}%
+              </div>
+            )}
           </div>
         );
       })()}
 
       <div style={{display:"flex",gap:12,alignItems:"center",marginBottom:16,flexWrap:"wrap"}}>
-        <div style={{display:"flex",alignItems:"center",gap:6}}>
+        <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
           <span style={{fontSize:10,color:"#475569",textTransform:"uppercase",letterSpacing:0.5}}>Show</span>
           {[["setup","★ Setup Active"],["conv2","★★ Conv≥2"],["tradable","✓ Tradable"],["posEV","+EV"],["be",`Win>${(beThresh*100).toFixed(0)}%`],["be5",`Win>${(beThresh5*100).toFixed(0)}%`],["top10","Top 10"],["top20","Top 20"]].map(([m,l])=>
             <Btn key={m} active={mode===m} onClick={()=>setMode(m)} color={m==="setup"?"#a855f7":m==="conv2"?"#d946ef":m==="tradable"?"#06b6d4":undefined}>{l}</Btn>)}
           {v33Available && (
             <>
               <span style={{fontSize:10,color:"#334155",marginLeft:6}}>|</span>
-              <Btn active={mode==="conv90"} onClick={()=>setMode("conv90")} color="#10b981">
-                High Conv ≥90%{highConv90.length>0?` (${highConv90.length})`:""}
+              <Btn active={mode==="conv90"} onClick={()=>setMode("conv90")} color="#10b981" title="Absolute threshold: conviction ≥90%. Regime-sensitive — fires only on favorable market-regime days.">
+                ≥90%{highConv90.length>0?` (${highConv90.length})`:""}
               </Btn>
-              <Btn active={mode==="conv80"} onClick={()=>setMode("conv80")} color="#14b8a6">
-                High Conv ≥80%{highConv80.length>0?` (${highConv80.length})`:""}
+              <Btn active={mode==="conv80"} onClick={()=>setMode("conv80")} color="#14b8a6" title="Absolute threshold: conviction ≥80%. Regime-sensitive.">
+                ≥80%{highConv80.length>0?` (${highConv80.length})`:""}
+              </Btn>
+              <span style={{fontSize:10,color:"#334155",marginLeft:4}}>|</span>
+              <Btn active={mode==="convTop5"} onClick={()=>setMode("convTop5")} color="#f59e0b" title="Relative: top 5% of v33 predictions within THIS scan hour. Self-normalizes across regime conditions — always produces signals, but quality depends on whether the day is favorable.">
+                Top 5%{convTop5.length>0?` (${convTop5.length})`:""}
+              </Btn>
+              <Btn active={mode==="convTop10"} onClick={()=>setMode("convTop10")} color="#eab308" title="Relative: top 10% of v33 predictions within THIS scan hour.">
+                Top 10%{convTop10.length>0?` (${convTop10.length})`:""}
               </Btn>
             </>
           )}
@@ -282,7 +301,14 @@ function ScannerTab({data,scanHour,source,elapsed,message,modelWR10,modelPnL10,h
             <>
               <div>No stocks at ≥80% v33 conviction at {scanHour}:00 ET.</div>
               <div style={{marginTop:6,fontSize:11,color:"#475569",maxWidth:560,marginLeft:"auto",marginRight:"auto",lineHeight:1.5}}>
-                Regime today is unfavorable for the v33 model. The setup-based scanner (★ Setup Active) still provides firings regardless of regime.
+                Regime today is unfavorable for the v33 model. Try <b>Top 5%</b> or <b>Top 10%</b> for relative-best picks regardless of regime, or use ★ Setup Active.
+              </div>
+            </>
+          ) : mode==="convTop5" || mode==="convTop10" ? (
+            <>
+              <div>No stocks ranked in v33 top-{mode==="convTop5"?"5%":"10%"} at {scanHour}:00 ET.</div>
+              <div style={{marginTop:6,fontSize:11,color:"#475569",maxWidth:560,marginLeft:"auto",marginRight:"auto",lineHeight:1.5}}>
+                v33 probabilities not populated yet — model may still be loading or scan incomplete.
               </div>
             </>
           ) : (
@@ -347,8 +373,17 @@ function ScannerTab({data,scanHour,source,elapsed,message,modelWR10,modelPnL10,h
                       else if (p >= 0.7) { c = "#a3e635"; w = 500; bg = "transparent"; }
                       else if (p >= 0.6) { c = "#94a3b8"; w = 400; bg = "transparent"; }
                       else { c = "#475569"; w = 400; bg = "transparent"; }
-                      const title = `v33 conviction: calibrated probability this stock reaches +${scanInfo?.v33Target||"0.32%"} by close. Regime-dependent — clusters on specific market days.`;
-                      return <span title={title} style={{color:c,fontWeight:w,padding:bg!=="transparent"?"1px 5px":0,borderRadius:2,background:bg}}>{pct}%</span>;
+                      const target = scanInfo?.v33Target || "0.32%";
+                      const rank = s.v33Rank;
+                      const pctile = s.v33Percentile;
+                      const showRank = mode === "conv90" || mode === "conv80" || mode === "convTop5" || mode === "convTop10";
+                      const title = `v33 conviction: calibrated probability this stock reaches +${target} by close.\nRank: #${rank ?? "?"} of hour (top ${pctile != null ? ((1-pctile)*100).toFixed(1) : "?"}%).\nRegime-dependent — clusters on specific market days.`;
+                      return (
+                        <span title={title} style={{color:c,fontWeight:w,padding:bg!=="transparent"?"1px 5px":0,borderRadius:2,background:bg}}>
+                          {pct}%
+                          {showRank && rank != null && <span style={{color:"#475569",fontWeight:400,fontSize:10,marginLeft:4}}>#{rank}</span>}
+                        </span>
+                      );
                     })()}
                   </td>
                   <td style={{padding:"5px 6px",color:"#64748b",fontSize:11}}>{s.sector}</td>
