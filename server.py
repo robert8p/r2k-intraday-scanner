@@ -239,7 +239,11 @@ def load_models():
 load_models()
 
 def load_v33_deploy():
-    """v33: load the conviction deployment model (trained for +0.32% target by v29)."""
+    """v33: load the conviction deployment model (trained for +0.32% target by v29).
+    v33.2: also inspect the isotonic calibrator to report what raw scores map to
+    key calibrated thresholds (0.8, 0.9). This disambiguates between "calibrator
+    structurally capped" vs "live raw scores just aren't reaching the threshold."
+    """
     global v33_deploy_model, v33_deploy_calibrator, v33_deploy_meta
     try:
         if V33_MODEL_PATH.exists() and V33_CALIB_PATH.exists() and V33_META_PATH.exists():
@@ -248,7 +252,72 @@ def load_v33_deploy():
             with open(V33_CALIB_PATH, "rb") as f:
                 v33_deploy_calibrator = pickle.load(f)
             v33_deploy_meta = json.loads(V33_META_PATH.read_text())
-            log.info(f"v33 deploy model loaded: target={v33_deploy_meta.get('target_label')}, AUC={v33_deploy_meta.get('auc_test')}")
+
+            # v33.2: inspect calibrator
+            try:
+                # IsotonicRegression with out_of_bounds="clip" has X_min_, X_max_ (raw bounds)
+                # and y_min_, y_max_ (calibrated bounds). Also X_thresholds_ / y_thresholds_
+                # for the full step function.
+                import numpy as _np
+                cal = v33_deploy_calibrator
+                raw_min = float(getattr(cal, "X_min_", _np.nan))
+                raw_max = float(getattr(cal, "X_max_", _np.nan))
+                calib_min = float(getattr(cal, "y_min_", _np.nan))
+                calib_max = float(getattr(cal, "y_max_", _np.nan))
+
+                # Sample the calibrator at many raw points to find raw→calib mapping
+                # at interesting thresholds
+                probe_raw = _np.linspace(raw_min, raw_max, 1000)
+                probe_calib = cal.transform(probe_raw)
+
+                def raw_for_calib(target):
+                    # Find the lowest raw score that produces calib >= target
+                    mask = probe_calib >= target
+                    if not mask.any():
+                        return None  # calibrator cannot reach this threshold
+                    return float(probe_raw[mask.argmax()])
+
+                raw_for_80 = raw_for_calib(0.80)
+                raw_for_85 = raw_for_calib(0.85)
+                raw_for_90 = raw_for_calib(0.90)
+
+                calib_info = {
+                    "raw_min": round(raw_min, 4),
+                    "raw_max": round(raw_max, 4),
+                    "calib_min": round(calib_min, 4),
+                    "calib_max": round(calib_max, 4),
+                    "raw_for_calib_0.80": round(raw_for_80, 4) if raw_for_80 is not None else None,
+                    "raw_for_calib_0.85": round(raw_for_85, 4) if raw_for_85 is not None else None,
+                    "raw_for_calib_0.90": round(raw_for_90, 4) if raw_for_90 is not None else None,
+                    "can_reach_0.80": raw_for_80 is not None,
+                    "can_reach_0.85": raw_for_85 is not None,
+                    "can_reach_0.90": raw_for_90 is not None,
+                }
+                v33_deploy_meta["calibrator_inspection"] = calib_info
+                log.info(
+                    f"v33 deploy model loaded: target={v33_deploy_meta.get('target_label')}, "
+                    f"AUC={v33_deploy_meta.get('auc_test')}"
+                )
+                log.info(
+                    f"v33 calibrator: raw range=[{calib_info['raw_min']}, {calib_info['raw_max']}], "
+                    f"calib range=[{calib_info['calib_min']}, {calib_info['calib_max']}], "
+                    f"raw→0.80={calib_info['raw_for_calib_0.80']}, "
+                    f"raw→0.85={calib_info['raw_for_calib_0.85']}, "
+                    f"raw→0.90={calib_info['raw_for_calib_0.90']}"
+                )
+                if not calib_info["can_reach_0.90"]:
+                    log.warning(
+                        "v33 calibrator CANNOT produce calibrated prob >= 0.90 "
+                        "— no val prediction reached that level during training. "
+                        "The ≥90% filter will never fire regardless of live raw scores."
+                    )
+                if not calib_info["can_reach_0.80"]:
+                    log.warning(
+                        "v33 calibrator CANNOT produce calibrated prob >= 0.80 "
+                        "— deployment is effectively broken for the stated purpose."
+                    )
+            except Exception as e:
+                log.error(f"Failed to inspect v33 calibrator: {e}")
         else:
             log.info("v33 deploy model not present (run v29 to train and save it)")
     except Exception as e:
@@ -7210,6 +7279,9 @@ def run_live_scan(scan_hour):
         wp = float(cal_probs[i])
         # v33: conviction probability for +0.32% target
         v33_prob = float(v33_probs[i]) if v33_probs is not None else None
+        # v33.2: also expose the raw (pre-calibration) score to disambiguate
+        # "low raw score" from "calibrator capped" when investigating signal absence
+        v33_raw = float(v33_raw_probs[i]) if v33_raw_probs is not None else None
         # Per-stock barriers in percent terms
         stock_tp_pct = active_tp_mult * si["atr_pct"]
         stock_sl_pct = active_sl_mult * si["atr_pct"]
@@ -7250,6 +7322,10 @@ def run_live_scan(scan_hour):
             "clearsThreshold":clears_threshold,
             # v33: conviction model probability for +0.32% target (None if model not loaded)
             "convictionV33Prob": round(v33_prob, 4) if v33_prob is not None else None,
+            # v33.2: raw (pre-isotonic-calibration) model score for diagnostic purposes.
+            # If calibrated is low and raw is also low → model genuinely not confident.
+            # If calibrated is capped at ~0.80 and raw is high → isotonic is saturating.
+            "convictionV33RawScore": round(v33_raw, 4) if v33_raw is not None else None,
             # v8: per-stock volatility-adjusted barriers
             "atrPct": round(si["atr_pct"]*100, 3),
             "tpPct": round(stock_tp_pct*100, 3),
@@ -7336,6 +7412,26 @@ def run_live_scan(scan_hour):
             "mean": round(float(np.mean(v33_probs_list)), 4),
         }
 
+    # v33.2: raw (pre-calibration) score distribution.
+    # If raw scores are compressed → model genuinely not finding high-confidence picks.
+    # If raw scores are spread but calib is capped at ~0.80 → calibrator artifact.
+    v33_raw_list = [r["convictionV33RawScore"] for r in results if r.get("convictionV33RawScore") is not None]
+    v33_raw_dist = None
+    if v33_raw_list:
+        v33_raw_sorted = sorted(v33_raw_list, reverse=True)
+        v33_raw_dist = {
+            "n": len(v33_raw_sorted),
+            "max": round(v33_raw_sorted[0], 4),
+            "p95": round(v33_raw_sorted[max(0, int(len(v33_raw_sorted) * 0.05) - 1)], 4),
+            "p90": round(v33_raw_sorted[max(0, int(len(v33_raw_sorted) * 0.10) - 1)], 4),
+            "median": round(v33_raw_sorted[len(v33_raw_sorted) // 2], 4),
+            "min": round(v33_raw_sorted[-1], 4),
+            "mean": round(float(np.mean(v33_raw_list)), 4),
+        }
+
+    # v33.2: calibrator inspection copied from meta (set at load time)
+    v33_calib_info = v33_deploy_meta.get("calibrator_inspection") if v33_deploy_meta else None
+
     scan_result = {
         "data":results,"timestamp":datetime.now(ET).isoformat(),"source":"live",
         "elapsed":elapsed,"scanHour":scan_hour,
@@ -7364,8 +7460,11 @@ def run_live_scan(scan_hour):
         "v33Target": v33_deploy_meta.get("target_label") if v33_deploy_meta else None,
         "v33HighConv90Count": n_conv_90,
         "v33HighConv80Count": n_conv_80,
-        # v33.1: distribution stats for this hour's v33 predictions
+        # v33.1: distribution stats for this hour's v33 predictions (calibrated)
         "v33Distribution": v33_dist,
+        # v33.2: raw-score distribution + calibrator inspection for diagnostic
+        "v33RawDistribution": v33_raw_dist,
+        "v33CalibratorInspection": v33_calib_info,
     }
 
     # v10/v13: persist each setup firing to SETUP_FIRING_LOG for live-validation tracking.
@@ -7836,6 +7935,14 @@ def v29_results_endpoint():
 # v33: deployment model metadata endpoint — tells UI whether v33 model is available and its stats
 @app.get("/api/v33/meta")
 def v33_meta_endpoint():
+    # v33.2: prefer the in-memory meta (which includes calibrator_inspection
+    # computed at load time) over the on-disk meta (which does not).
+    if v33_deploy_meta is not None:
+        return {
+            "available": True,
+            "meta": v33_deploy_meta,
+            "live_model_loaded": v33_deploy_model is not None,
+        }
     if not V33_META_PATH.exists():
         return {"available": False, "message": "v33 deployment model not trained yet. Run v29 to generate it."}
     try:
@@ -7843,6 +7950,40 @@ def v33_meta_endpoint():
         return {"available": True, "meta": meta, "live_model_loaded": v33_deploy_model is not None}
     except Exception as e:
         return JSONResponse({"error":str(e)},500)
+
+@app.get("/api/v33/diagnostic")
+def v33_diagnostic_endpoint():
+    """v33.2: comprehensive v33 diagnostic — meta, calibrator inspection,
+    and last-scan distributions all in one place. Used to investigate why
+    high-conviction signals aren't firing in live data."""
+    out = {
+        "generated_at": datetime.now(ET).isoformat(),
+        "model_loaded": v33_deploy_model is not None,
+        "calibrator_loaded": v33_deploy_calibrator is not None,
+        "meta": v33_deploy_meta,
+    }
+    # Per-hour last-scan distribution + top-10 raw/calib pairs
+    per_hour = {}
+    for h_str, scan in last_scans.items():
+        rows = scan.get("data", [])
+        v33_pairs = [
+            {
+                "ticker": r.get("ticker"),
+                "raw": r.get("convictionV33RawScore"),
+                "calib": r.get("convictionV33Prob"),
+            }
+            for r in rows
+            if r.get("convictionV33RawScore") is not None
+        ]
+        v33_pairs.sort(key=lambda x: -(x["raw"] or 0))
+        per_hour[h_str] = {
+            "timestamp": scan.get("timestamp"),
+            "v33Distribution": scan.get("v33Distribution"),
+            "v33RawDistribution": scan.get("v33RawDistribution"),
+            "top10_raw_calib_pairs": v33_pairs[:10],
+        }
+    out["per_hour"] = per_hour
+    return JSONResponse(out)
 
 # v30: confident examples dump endpoints
 @app.post("/api/v30/train")
