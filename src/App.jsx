@@ -714,6 +714,21 @@ function TrainingTab() {
     return ()=>clearInterval(iv);
   },[pollV32]);
 
+  // v34: deployment replay state
+  const [v34Prog, setV34Prog] = useState(null);
+  const [v34Results, setV34Results] = useState(null);
+  const pollV34 = useCallback(()=>{
+    fetch('/api/v34/progress').then(r=>r.json()).then(setV34Prog).catch(()=>{});
+    fetch('/api/v34/results').then(r=>r.json()).then(d=>{
+      if (d && !d.status) setV34Results(d);
+    }).catch(()=>{});
+  },[]);
+  useEffect(()=>{
+    pollV34();
+    const iv=setInterval(pollV34, 3000);
+    return ()=>clearInterval(iv);
+  },[pollV34]);
+
   const trigTrain=async()=>{
     await fetch('/api/train',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({tp_mult:tp,sl_mult:sl})});
@@ -780,6 +795,13 @@ function TrainingTab() {
     const d=await r.json();
     if(d.error) alert(`Error: ${d.error}`);
     pollV32();
+  };
+  const runV34=async()=>{
+    if(!confirm("Run v34 deployment replay? Loads the SAVED v33 model + calibrator and replays them against every test-fold (date × scan_hour) using the exact live-scanner feature path. Answers: does the saved model reproduce v29 test-fold stats? Can the calibrator reach ≥0.80/≥0.90? How often would high-conviction have fired historically? Takes ~10-15 minutes.")) return;
+    const r=await fetch('/api/v34/train',{method:'POST'});
+    const d=await r.json();
+    if(d.error) alert(`Error: ${d.error}`);
+    pollV34();
   };
 
   if(ld) return <div style={{color:"#475569",padding:40,textAlign:"center"}}>Loading...</div>;
@@ -1747,6 +1769,136 @@ function TrainingTab() {
                 </tbody>
               </table>
             </details>
+          </div>
+        )}
+      </Box>
+
+      {/* v34: DEPLOYMENT REPLAY — replay saved v33 model against test-fold dates */}
+      <Box>
+        <Lbl>Deployment Replay (v34) — replay saved v33 model against test-fold dates</Lbl>
+        <div style={{fontSize:10,color:"#475569",marginBottom:10,lineHeight:1.5}}>
+          Loads the <b>saved</b> v33 model + calibrator (the exact artifacts live scanning uses), walks every test-fold (date × scan_hour), builds features via the live-scanner path, and scores every stock. Gives ground truth on: <b>(a)</b> does the saved model reproduce v29 test-fold stats? <b>(b)</b> can the calibrator structurally reach ≥0.80/≥0.90? <b>(c)</b> how often would "high conviction" have fired historically? No live waiting — uses cached bars.
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:10}}>
+          <Btn onClick={runV34} disabled={v34Prog?.inProgress||ip||extProg?.inProgress||repairProg?.inProgress||convProg?.inProgress||patProg?.inProgress||v28Prog?.inProgress||v29Prog?.inProgress||v30Prog?.inProgress||v32Prog?.inProgress} color="#f97316" style={{padding:"8px 16px",fontSize:12}}>
+            {v34Prog?.inProgress?"Running...":"Run v34 Deployment Replay"}
+          </Btn>
+          {v34Results && !v34Prog?.inProgress && (
+            <>
+              <Btn onClick={()=>downloadJson(v34Results,`v34_deployment_replay_${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.json`)} color="#06b6d4" style={{padding:"8px 12px",fontSize:12}}>
+                Download JSON
+              </Btn>
+              <span style={{fontSize:11,color:"#64748b"}}>
+                Last run: {v34Results.generated_at?.slice(0,19).replace("T"," ")}
+              </span>
+            </>
+          )}
+        </div>
+        {v34Prog?.inProgress && (
+          <div style={{marginTop:10,marginBottom:10}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+              <div style={{flex:1,height:6,background:"rgba(255,255,255,0.06)",borderRadius:3,overflow:"hidden"}}>
+                <div style={{width:`${v34Prog.pct||0}%`,height:"100%",background:"#f97316",borderRadius:3,transition:"width 0.5s"}}/>
+              </div>
+              <span style={{fontSize:11,color:"#f97316",fontWeight:600}}>{v34Prog.pct||0}%</span>
+            </div>
+            <div style={{fontSize:11,color:"#64748b"}}>{v34Prog.message}</div>
+          </div>
+        )}
+        {!v34Prog?.inProgress && v34Prog?.phase === "error" && (
+          <div style={{marginTop:10,padding:"6px 10px",borderRadius:4,background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.2)"}}>
+            <div style={{fontSize:11,color:"#fca5a5",fontWeight:600}}>✗ {v34Prog.message}</div>
+          </div>
+        )}
+        {v34Results && (
+          <div style={{marginTop:14}}>
+            {/* Headline: ≥90/≥80 firing counts on test fold */}
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:8,marginBottom:10}}>
+              <div style={{padding:"8px 12px",borderRadius:4,background:"rgba(16,185,129,0.06)",border:"1px solid rgba(16,185,129,0.2)"}}>
+                <div style={{fontSize:10,color:"#64748b",fontWeight:600,letterSpacing:0.3,textTransform:"uppercase"}}>≥90% firings</div>
+                <div style={{fontSize:16,color:"#10b981",fontWeight:700}}>{v34Results.dates_with_90pct_firings?.total_n_firings_at_90pct}</div>
+                <div style={{fontSize:10,color:"#64748b"}}>on {v34Results.dates_with_90pct_firings?.n_dates} dates ({((v34Results.dates_with_90pct_firings?.fraction_of_test_days||0)*100).toFixed(1)}% of test days)</div>
+              </div>
+              <div style={{padding:"8px 12px",borderRadius:4,background:"rgba(20,184,166,0.06)",border:"1px solid rgba(20,184,166,0.2)"}}>
+                <div style={{fontSize:10,color:"#64748b",fontWeight:600,letterSpacing:0.3,textTransform:"uppercase"}}>≥80% firings</div>
+                <div style={{fontSize:16,color:"#14b8a6",fontWeight:700}}>{v34Results.dates_with_80pct_firings?.total_n_firings_at_80pct}</div>
+                <div style={{fontSize:10,color:"#64748b"}}>on {v34Results.dates_with_80pct_firings?.n_dates} dates ({((v34Results.dates_with_80pct_firings?.fraction_of_test_days||0)*100).toFixed(1)}% of test days)</div>
+              </div>
+              <div style={{padding:"8px 12px",borderRadius:4,background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.04)"}}>
+                <div style={{fontSize:10,color:"#64748b",fontWeight:600,letterSpacing:0.3,textTransform:"uppercase"}}>Total firings</div>
+                <div style={{fontSize:16,color:"#e2e8f0",fontWeight:700}}>{v34Results.n_firings?.toLocaleString()}</div>
+                <div style={{fontSize:10,color:"#64748b"}}>across {v34Results.test_fold_dates?.n_dates_with_firings} dates. Hit rate overall: {v34Results.overall_hit_rate_pct}%</div>
+              </div>
+            </div>
+
+            {/* Raw vs calib score ranges — key diagnostic */}
+            <div style={{fontSize:10,color:"#94a3b8",fontWeight:600,textTransform:"uppercase",letterSpacing:0.3,marginBottom:4,marginTop:10}}>Score ranges (replay aggregate)</div>
+            <table style={{width:"100%",fontSize:11,borderCollapse:"collapse",marginBottom:10}}>
+              <thead><tr>
+                {["","min","median","mean","p95","p99","max"].map(col=>
+                  <th key={col} style={{padding:"3px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase"}}>{col}</th>)}
+              </tr></thead>
+              <tbody>
+                <tr style={{borderTop:"1px solid rgba(255,255,255,0.04)"}}>
+                  <td style={{padding:"3px 8px",color:"#c4b5fd",fontWeight:600}}>Raw</td>
+                  <td style={{padding:"3px 8px",color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>{v34Results.raw_score_stats?.min}</td>
+                  <td style={{padding:"3px 8px",color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>{v34Results.raw_score_stats?.median}</td>
+                  <td style={{padding:"3px 8px",color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>{v34Results.raw_score_stats?.mean}</td>
+                  <td style={{padding:"3px 8px",color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>{v34Results.raw_score_stats?.p95}</td>
+                  <td style={{padding:"3px 8px",color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>{v34Results.raw_score_stats?.p99}</td>
+                  <td style={{padding:"3px 8px",color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>{v34Results.raw_score_stats?.max}</td>
+                </tr>
+                <tr style={{borderTop:"1px solid rgba(255,255,255,0.04)"}}>
+                  <td style={{padding:"3px 8px",color:"#c4b5fd",fontWeight:600}}>Calib</td>
+                  <td style={{padding:"3px 8px",color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>{v34Results.calib_score_stats?.min}</td>
+                  <td style={{padding:"3px 8px",color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>{v34Results.calib_score_stats?.median}</td>
+                  <td style={{padding:"3px 8px",color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>{v34Results.calib_score_stats?.mean}</td>
+                  <td style={{padding:"3px 8px",color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>{v34Results.calib_score_stats?.p95}</td>
+                  <td style={{padding:"3px 8px",color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>{v34Results.calib_score_stats?.p99}</td>
+                  <td style={{padding:"3px 8px",color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>{v34Results.calib_score_stats?.max}</td>
+                </tr>
+              </tbody>
+            </table>
+
+            {/* Calibration buckets — replay vs v29 meta */}
+            <div style={{fontSize:10,color:"#94a3b8",fontWeight:600,textTransform:"uppercase",letterSpacing:0.3,marginBottom:4,marginTop:10}}>Calibration buckets — replay vs v29 meta</div>
+            <table style={{width:"100%",fontSize:11,borderCollapse:"collapse",marginBottom:10}}>
+              <thead><tr>
+                {["Bucket","Replay n","Replay hit%","Replay CI","Meta n","Meta hit%","Match?"].map(col=>
+                  <th key={col} style={{padding:"3px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500,letterSpacing:0.3,textTransform:"uppercase"}}>{col}</th>)}
+              </tr></thead>
+              <tbody>
+                {(v34Results.calibration_buckets||[]).map((b,bi)=>{
+                  const meta = (v34Results.v29_test_fold_buckets_from_meta||[]).find(m=>m.bucket===b.bucket);
+                  const match = meta && meta.n != null && b.n != null && Math.abs((meta.n - b.n)/(meta.n || 1)) < 0.02;
+                  const isHigh = b.bucket==="0.8-0.9"||b.bucket==="0.9+";
+                  return <tr key={bi} style={{borderTop:"1px solid rgba(255,255,255,0.04)",background:isHigh?"rgba(249,115,22,0.06)":"transparent"}}>
+                    <td style={{padding:"3px 8px",color:isHigh?"#fb923c":"#e2e8f0",fontWeight:isHigh?600:400}}>{b.bucket}</td>
+                    <td style={{padding:"3px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{b.n}</td>
+                    <td style={{padding:"3px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{b.hit_rate_pct!=null?`${b.hit_rate_pct}%`:"—"}</td>
+                    <td style={{padding:"3px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums",fontSize:10}}>{b.ci_lower_pct!=null?`[${b.ci_lower_pct}, ${b.ci_upper_pct}]%`:"—"}</td>
+                    <td style={{padding:"3px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{meta?.n ?? "—"}</td>
+                    <td style={{padding:"3px 8px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>{meta?.hit_rate_pct!=null?`${meta.hit_rate_pct}%`:"—"}</td>
+                    <td style={{padding:"3px 8px",fontSize:10,color:match===true?"#22c55e":match===false?"#eab308":"#64748b"}}>{match===true?"✓":match===false?"⚠ diff":"—"}</td>
+                  </tr>;
+                })}
+              </tbody>
+            </table>
+
+            {/* Calibrator inspection */}
+            {v34Results.calibrator_inspection && (
+              <div style={{marginTop:10,padding:"6px 10px",borderRadius:4,background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.04)"}}>
+                <div style={{fontSize:10,color:"#94a3b8",fontWeight:600,textTransform:"uppercase",letterSpacing:0.3,marginBottom:3}}>Calibrator inspection (from model load)</div>
+                <div style={{fontSize:11,color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>
+                  raw range [{v34Results.calibrator_inspection.raw_min}, {v34Results.calibrator_inspection.raw_max}] → calib range [{v34Results.calibrator_inspection.calib_min}, {v34Results.calibrator_inspection.calib_max}]
+                </div>
+                <div style={{fontSize:10,color:"#64748b",marginTop:2}}>
+                  raw needed for calib ≥0.80: <b style={{color:v34Results.calibrator_inspection["can_reach_0.80"]?"#22c55e":"#ef4444"}}>{v34Results.calibrator_inspection["raw_for_calib_0.80"] ?? "UNREACHABLE"}</b> · 
+                  ≥0.85: <b style={{color:v34Results.calibrator_inspection["can_reach_0.85"]?"#22c55e":"#ef4444"}}>{v34Results.calibrator_inspection["raw_for_calib_0.85"] ?? "UNREACHABLE"}</b> · 
+                  ≥0.90: <b style={{color:v34Results.calibrator_inspection["can_reach_0.90"]?"#22c55e":"#ef4444"}}>{v34Results.calibrator_inspection["raw_for_calib_0.90"] ?? "UNREACHABLE"}</b>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </Box>

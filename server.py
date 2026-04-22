@@ -6688,6 +6688,298 @@ def run_v32_regime_decontaminated(target_pct=0.0032):
         v32_in_progress = False
 
 
+# ═══════════════════════════════════════════════════════════════════
+# v34: DEPLOYMENT REPLAY
+# Loads the SAVED v33 model + calibrator (the exact artifacts used in live
+# scanning) and replays them against every test-fold (date × scan_hour) using
+# the exact same feature construction path the live scanner uses. This
+# disambiguates three things at once:
+#   (a) does the saved model reproduce v29 test-fold stats? If not → save/load corruption
+#   (b) can the calibrator actually output ≥0.80/≥0.90? If not → structural artifact
+#   (c) how often would "high conviction" have fired historically? ground truth for
+#       live expectations
+# No waiting. ~10-15 minutes of compute.
+# ═══════════════════════════════════════════════════════════════════
+V34_RESULTS_PATH = DATA_DIR / "v34_deployment_replay.json"
+v34_in_progress = False
+v34_progress = {"phase":"idle","pct":0,"message":""}
+
+def run_v34_replay():
+    """Replay the saved v33 model against test-fold dates using live scanner feature path."""
+    global v34_in_progress, v34_progress
+    if v34_in_progress:
+        log.warning("v34 already running"); return
+    v34_in_progress = True
+    v34_progress = {"phase":"starting","pct":0,"message":"Starting v34 replay..."}
+
+    try:
+        if v33_deploy_model is None or v33_deploy_calibrator is None or v33_deploy_meta is None:
+            raise RuntimeError("v33 deployment model not loaded. Run v29 first to generate it.")
+        if not (BARS_DAILY_CACHE.exists() and BARS_INTRADAY_CACHE.exists()):
+            raise RuntimeError("No bar cache. Run Training first.")
+
+        import numpy as _np
+
+        v34_progress = {"phase":"loading","pct":2,"message":"Loading bars..."}
+        daily_bars = pickle.loads(BARS_DAILY_CACHE.read_bytes())
+        intraday_bars = pickle.loads(BARS_INTRADAY_CACHE.read_bytes())
+
+        iwm_daily = daily_bars.get("IWM", [])
+        if len(iwm_daily) < 200:
+            raise RuntimeError("Insufficient IWM history")
+        all_dates_list = sorted(set(b["t"][:10] for b in iwm_daily))
+        n_dates = len(all_dates_list)
+        split_tr = int(n_dates * 0.60)
+        split_va = int(n_dates * 0.80)
+        test_dates_sorted = all_dates_list[split_va:]
+        test_dates = set(test_dates_sorted)
+        log.info(f"v34 replay: {len(test_dates)} test-fold dates from {test_dates_sorted[0]} to {test_dates_sorted[-1]}")
+
+        def bars_for_date(ticker, date):
+            return [b for b in intraday_bars.get(ticker, []) if b["t"][:10] == date]
+        def daily_up_to(ticker, date):
+            return [b for b in daily_bars.get(ticker, []) if b["t"][:10] < date]
+
+        # Exact feature schema from saved v33 meta
+        expected_feat_names = v33_deploy_meta.get("feature_names", [])
+        base_feat_names = FEATURE_NAMES
+        setup_feat_names = [f"setup_{s}" for s in SETUP_NAMES]
+        all_feat_names = base_feat_names + setup_feat_names + ["hour_11","hour_12","hour_13","hour_14","hour_15"]
+        if all_feat_names != expected_feat_names:
+            log.warning(f"v34: feature schema mismatch. Built {len(all_feat_names)}, meta has {len(expected_feat_names)}. Proceeding with built schema.")
+
+        target_pct = v33_deploy_meta.get("target_pct", 0.0032)
+        tickers_list = [t for t in TICKERS if t not in ("SPY", "IWM")]
+
+        # Accumulators
+        all_firings = []  # per-row records: date, hour, ticker, raw, calib, hit, path_peak, path_close
+        per_date_hour = {}  # (date, hour) -> stats for that scan
+        n_total_rows = 0
+        n_rows_with_pred = 0
+
+        for di, date in enumerate(test_dates_sorted):
+            if (di + 1) % 5 == 0:
+                pct = 5 + int((di / len(test_dates_sorted)) * 90)
+                v34_progress = {"phase":"replaying","pct":pct,
+                    "message":f"Replaying date {di+1}/{len(test_dates_sorted)}: {date}"}
+
+            spy_intraday_date = [b for b in intraday_bars.get("SPY", []) if b["t"][:10] == date]
+            iwm_intraday_date = [b for b in intraday_bars.get("IWM", []) if b["t"][:10] == date]
+
+            for scan_hour in SCAN_HOURS:
+                scan_minute_et = scan_hour * 60
+                spy_before = [b for b in spy_intraday_date if (bar_to_et_minutes(b) or -1) < scan_minute_et]
+                iwm_before = [b for b in iwm_intraday_date if (bar_to_et_minutes(b) or -1) < scan_minute_et]
+                spy_ctx = compute_spy_context(spy_before) if spy_before else None
+
+                sector_green_count = defaultdict(lambda: [0, 0])
+                cache_per_tkr = {}
+                for tkr in tickers_list:
+                    tbars = bars_for_date(tkr, date)
+                    if len(tbars) < 6: continue
+                    tb = [b for b in tbars if (bar_to_et_minutes(b) or -1) < scan_minute_et]
+                    ta = [b for b in tbars if (bar_to_et_minutes(b) or -1) >= scan_minute_et]
+                    if len(tb) < 6 or len(ta) < 2: continue
+                    dl = daily_up_to(tkr, date)
+                    pc = dl[-1]["c"] if dl else None
+                    if pc is None: continue
+                    sp = tb[-1]["c"]
+                    sec = SECTORS.get(tkr, "?")
+                    sector_green_count[sec][1] += 1
+                    if sp > pc: sector_green_count[sec][0] += 1
+                    cache_per_tkr[tkr] = (tb, ta, sp, pc, dl, sec)
+
+                date_hour_rows = []
+                for ticker, (before, after, scan_price, prev_close, dl, sec) in cache_per_tkr.items():
+                    open_price = before[0]["o"]
+                    feat = compute_features(before, dl, scan_price, open_price, scan_hour,
+                                            spy_context=spy_ctx, prev_close=prev_close)
+                    if feat is None: continue
+                    sgc = sector_green_count[sec]
+                    breadth = sgc[0] / sgc[1] if sgc[1] > 0 else 0
+                    active = detect_setups(before, scan_price, prev_close,
+                                           sector_breadth=breadth, prior_daily=dl,
+                                           iwm_bars=iwm_before, scan_minute_et=scan_minute_et)
+                    setup_flags = {f"setup_{s}": int(bool(active[s])) for s in SETUP_NAMES}
+                    hit, _ = did_hit_target(scan_price, after[1:], target_pct=target_pct)
+                    # Compute post-scan peak and close for diagnostic
+                    peaks_pct = [((b["h"] - scan_price) / scan_price * 100) for b in after[1:] if b.get("h")]
+                    peak_pct = max(peaks_pct) if peaks_pct else 0.0
+                    close_pct = ((after[-1]["c"] - scan_price) / scan_price * 100) if after else 0.0
+
+                    date_hour_rows.append({
+                        "feat": feat, "setup_flags": setup_flags, "sector": sec,
+                        "ticker": ticker, "scan_price": scan_price,
+                        "hit": 1 if hit else 0,
+                        "peak_pct": round(peak_pct, 3),
+                        "close_pct": round(close_pct, 3),
+                    })
+
+                if len(date_hour_rows) < 10: continue
+                feats_list = [r["feat"] for r in date_hour_rows]
+                sectors_list = [r["sector"] for r in date_hour_rows]
+                add_ranks(feats_list)
+                add_sector_relative(feats_list, sectors_list)
+
+                # Build feature matrix
+                X = []
+                for r in date_hour_rows:
+                    vec = [float(r["feat"].get(k, 0.0) or 0.0) for k in base_feat_names]
+                    vec += [float(r["setup_flags"].get(k, 0)) for k in setup_feat_names]
+                    vec += [1.0 if scan_hour == h else 0.0 for h in [11,12,13,14,15]]
+                    X.append(vec)
+                X_np = _np.array(X, dtype=_np.float32)
+
+                # Score through SAVED model + calibrator
+                raw_probs = v33_deploy_model.predict(X_np, num_iteration=v33_deploy_model.best_iteration)
+                calib_probs = v33_deploy_calibrator.transform(raw_probs)
+
+                # Record each firing
+                for i, r in enumerate(date_hour_rows):
+                    raw = float(raw_probs[i])
+                    calib = float(calib_probs[i])
+                    all_firings.append({
+                        "date": date, "hour": scan_hour, "ticker": r["ticker"],
+                        "sector": r["sector"],
+                        "raw": round(raw, 4), "calib": round(calib, 4),
+                        "hit": r["hit"], "peak_pct": r["peak_pct"], "close_pct": r["close_pct"],
+                    })
+                    n_total_rows += 1
+                    n_rows_with_pred += 1
+
+                # Per-(date,hour) stats
+                raws = _np.array([float(p) for p in raw_probs])
+                cals = _np.array([float(p) for p in calib_probs])
+                per_date_hour[f"{date}|{scan_hour}"] = {
+                    "date": date, "hour": scan_hour, "n_stocks": len(date_hour_rows),
+                    "raw_max": round(float(raws.max()), 4),
+                    "raw_p95": round(float(_np.percentile(raws, 95)), 4),
+                    "raw_p90": round(float(_np.percentile(raws, 90)), 4),
+                    "raw_median": round(float(_np.percentile(raws, 50)), 4),
+                    "raw_mean": round(float(raws.mean()), 4),
+                    "calib_max": round(float(cals.max()), 4),
+                    "calib_p95": round(float(_np.percentile(cals, 95)), 4),
+                    "calib_p90": round(float(_np.percentile(cals, 90)), 4),
+                    "calib_median": round(float(_np.percentile(cals, 50)), 4),
+                    "calib_mean": round(float(cals.mean()), 4),
+                    "n_calib_ge_90": int((cals >= 0.90).sum()),
+                    "n_calib_ge_80": int((cals >= 0.80).sum()),
+                    "n_calib_ge_70": int((cals >= 0.70).sum()),
+                }
+
+        v34_progress = {"phase":"aggregating","pct":96,"message":"Aggregating results..."}
+
+        # Aggregate replay statistics
+        if not all_firings:
+            raise RuntimeError("No firings generated — check bar cache and test-fold dates")
+
+        import numpy as _np
+        all_raw = _np.array([f["raw"] for f in all_firings])
+        all_cal = _np.array([f["calib"] for f in all_firings])
+        all_hits = _np.array([f["hit"] for f in all_firings])
+
+        def bucket_stats(lo, hi, label):
+            mask = (all_cal >= lo) & (all_cal < hi)
+            n = int(mask.sum())
+            if n == 0:
+                return {"bucket": label, "n": 0, "hit_rate_pct": None,
+                        "ci_lower_pct": None, "ci_upper_pct": None, "n_hits": 0}
+            hits = int(all_hits[mask].sum())
+            lower, upper = wilson_ci(hits, n)
+            return {
+                "bucket": label, "n": n, "n_hits": hits,
+                "hit_rate_pct": round(hits / n * 100, 2),
+                "ci_lower_pct": round(lower * 100, 2),
+                "ci_upper_pct": round(upper * 100, 2),
+            }
+
+        calib_buckets = [
+            bucket_stats(0.0, 0.3, "0.0-0.3"),
+            bucket_stats(0.3, 0.4, "0.3-0.4"),
+            bucket_stats(0.4, 0.5, "0.4-0.5"),
+            bucket_stats(0.5, 0.6, "0.5-0.6"),
+            bucket_stats(0.6, 0.7, "0.6-0.7"),
+            bucket_stats(0.7, 0.8, "0.7-0.8"),
+            bucket_stats(0.8, 0.9, "0.8-0.9"),
+            bucket_stats(0.9, 1.01, "0.9+"),
+        ]
+
+        # Dates where ≥90% fired (how rare is it?)
+        dates_with_90 = sorted(set(f["date"] for f in all_firings if f["calib"] >= 0.90))
+        dates_with_80 = sorted(set(f["date"] for f in all_firings if f["calib"] >= 0.80))
+        unique_test_dates = sorted(set(f["date"] for f in all_firings))
+
+        # Top 20 calib firings with outcomes (qualitative spot check)
+        top_by_calib = sorted(all_firings, key=lambda f: -f["calib"])[:20]
+        # Top 20 raw firings with outcomes
+        top_by_raw = sorted(all_firings, key=lambda f: -f["raw"])[:20]
+
+        # Compare to v29 test-fold stats from meta
+        v29_buckets_from_meta = v33_deploy_meta.get("buckets", [])
+
+        results = {
+            "generated_at": datetime.now(ET).isoformat(),
+            "test_fold_dates": {
+                "first": test_dates_sorted[0], "last": test_dates_sorted[-1],
+                "n_dates_scanned": len(test_dates_sorted),
+                "n_dates_with_firings": len(unique_test_dates),
+            },
+            "n_firings": len(all_firings),
+            "target_pct": target_pct,
+            "target_label": v33_deploy_meta.get("target_label"),
+            "overall_hit_rate_pct": round(float(all_hits.mean()) * 100, 2),
+            "raw_score_stats": {
+                "min": round(float(all_raw.min()), 4),
+                "max": round(float(all_raw.max()), 4),
+                "p95": round(float(_np.percentile(all_raw, 95)), 4),
+                "p99": round(float(_np.percentile(all_raw, 99)), 4),
+                "median": round(float(_np.percentile(all_raw, 50)), 4),
+                "mean": round(float(all_raw.mean()), 4),
+            },
+            "calib_score_stats": {
+                "min": round(float(all_cal.min()), 4),
+                "max": round(float(all_cal.max()), 4),
+                "p95": round(float(_np.percentile(all_cal, 95)), 4),
+                "p99": round(float(_np.percentile(all_cal, 99)), 4),
+                "median": round(float(_np.percentile(all_cal, 50)), 4),
+                "mean": round(float(all_cal.mean()), 4),
+            },
+            "calibrator_inspection": v33_deploy_meta.get("calibrator_inspection"),
+            "calibration_buckets": calib_buckets,
+            "v29_test_fold_buckets_from_meta": v29_buckets_from_meta,
+            "dates_with_90pct_firings": {
+                "n_dates": len(dates_with_90),
+                "total_n_firings_at_90pct": int((all_cal >= 0.90).sum()),
+                "dates": dates_with_90,
+                "fraction_of_test_days": round(len(dates_with_90) / max(len(unique_test_dates), 1), 4),
+            },
+            "dates_with_80pct_firings": {
+                "n_dates": len(dates_with_80),
+                "total_n_firings_at_80pct": int((all_cal >= 0.80).sum()),
+                "dates": dates_with_80,
+                "fraction_of_test_days": round(len(dates_with_80) / max(len(unique_test_dates), 1), 4),
+            },
+            "top20_by_calibrated": top_by_calib,
+            "top20_by_raw": top_by_raw,
+            "per_date_hour": per_date_hour,
+        }
+        V34_RESULTS_PATH.write_text(json.dumps(results, indent=2, default=str))
+
+        log.info(f"v34 replay complete: {len(all_firings)} firings across {len(unique_test_dates)} dates. "
+                 f"n_≥90={results['dates_with_90pct_firings']['total_n_firings_at_90pct']}, "
+                 f"n_≥80={results['dates_with_80pct_firings']['total_n_firings_at_80pct']}.")
+        v34_progress = {"phase":"done","pct":100,
+            "message":(f"Done. {len(all_firings)} firings across {len(unique_test_dates)} test dates. "
+                       f"≥90%: {results['dates_with_90pct_firings']['total_n_firings_at_90pct']} firings on {len(dates_with_90)} dates.")}
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        log.error(f"v34 failed: {e}\n{tb}", exc_info=True)
+        v34_progress = {"phase":"error","pct":0,"message":str(e)}
+    finally:
+        v34_in_progress = False
+
+
 # Evidence-quality thresholds for declaring a setup tradable at a given hour.
 # A setup is "active" only at scan hours where it survived test-fold evaluation.
 # These thresholds are deliberately conservative.
@@ -8036,6 +8328,35 @@ def v32_results_endpoint():
         return json.loads(V32_RESULTS_PATH.read_text())
     except Exception as e:
         return JSONResponse({"error":str(e)},500)
+
+# v34: deployment replay endpoints
+@app.post("/api/v34/train")
+def trigger_v34(bg: BackgroundTasks):
+    if v34_in_progress: return {"status":"already_running"}
+    if (training_in_progress or setup_eval_in_progress or
+        conviction_train_in_progress or pattern_discovery_in_progress or
+        v28_in_progress or v29_in_progress or v30_in_progress or v32_in_progress):
+        return JSONResponse({"error":"Another task running"},400)
+    if v33_deploy_model is None or v33_deploy_calibrator is None:
+        return JSONResponse({"error":"v33 deployment model not loaded. Run v29 first."},400)
+    if not (BARS_DAILY_CACHE.exists() and BARS_INTRADAY_CACHE.exists()):
+        return JSONResponse({"error":"Bar cache missing"},400)
+    bg.add_task(run_v34_replay)
+    return {"status":"started"}
+
+@app.get("/api/v34/progress")
+def v34_progress_endpoint():
+    return {"inProgress":v34_in_progress, **v34_progress}
+
+@app.get("/api/v34/results")
+def v34_results_endpoint():
+    if not V34_RESULTS_PATH.exists():
+        return {"status":"no_results"}
+    try:
+        return json.loads(V34_RESULTS_PATH.read_text())
+    except Exception as e:
+        return JSONResponse({"error":str(e)},500)
+
 
 
 
